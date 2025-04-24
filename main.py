@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 import sys
 
-# from visualization import generate_report_visualizations
+from visualization import generate_report_visualizations  # Import the visualization function
 from config import StableSSLConfig
 from train_ssl_tf2n import ImprovedSSLTrainer, MixMatchTrainer, HighPerformanceSSLTrainer, StableSSLTrainer, SupervisedTrainer
 from data_loader_tf2 import DataPipeline  # Import DataPipeline
