@@ -1,5 +1,4 @@
 import tensorflow as tf
-import tensorflow_addons as tfa
 import numpy as np
 from pathlib import Path
 import time
@@ -13,13 +12,24 @@ import tqdm
 from models_tf2 import *
 from data_loader_tf2 import DataPipeline, PancreasDataLoader
 
+# Configure logger
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('training.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
-#GPU
+# GPU setup with direct placement fallback
 def setup_gpu():
-    """Setup GPU for training"""
-    print("Checking GPU availability...")
+    """Setup GPU for training with TF 2.18.0 compatibility and direct device placement"""
+    logger.info("Checking GPU availability...")
     gpus = tf.config.list_physical_devices('GPU')
     
+    # Try standard GPU setup first
     if gpus:
         try:
             # Use all available GPUs and allow memory growth
@@ -27,23 +37,73 @@ def setup_gpu():
                 tf.config.experimental.set_memory_growth(gpu, True)
             
             # Log GPU information
-            print(f"Found {len(gpus)} GPU(s):")
+            logger.info(f"Found {len(gpus)} GPU(s):")
             for gpu in gpus:
-                print(f"  {gpu.device_type}: {gpu.name}")
+                logger.info(f"  {gpu.device_type}: {gpu.name}")
                 
-            # Set mixed precision policy
-            tf.keras.mixed_precision.set_global_policy('float32')  # Changed to float32 for stability
-            print("Using float32 precision")
+            # Set mixed precision policy - using mixed_float16 for better performance
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            tf.keras.mixed_precision.set_global_policy(policy)
+            logger.info(f"Using {policy.name} precision")
             
             return True
         except RuntimeError as e:
-            print(f"GPU setup error: {e}")
-            return False
-    else:
-        print("No GPU found. Using CPU.")
-        return False
+            logger.error(f"GPU setup error: {e}")
+    
+    # Fallback to checking if nvidia-smi works
+    try:
+        import subprocess
+        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode == 0:
+            logger.info("NVIDIA GPU detected through nvidia-smi")
+            
+            # Try a simple GPU operation to confirm usability
+            try:
+                with tf.device('/device:GPU:0'):
+                    a = tf.constant([[1.0, 2.0], [3.0, 4.0]])
+                    b = tf.constant([[5.0, 6.0], [7.0, 8.0]])
+                    c = tf.matmul(a, b)
+                    _ = c.numpy()  # Force execution
+                    logger.info("GPU is accessible via direct device placement!")
+                    
+                    # Set mixed precision policy for better performance
+                    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+                    tf.keras.mixed_precision.set_global_policy(policy)
+                    logger.info(f"Using {policy.name} precision with direct GPU access")
+                    return True
+            except Exception as e:
+                logger.error(f"Error using GPU via direct placement: {e}")
+        else:
+            logger.warning("No GPU detected via nvidia-smi")
+    except Exception:
+        pass
+    
+    logger.warning("No GPU found. Using CPU.")
+    return False
 
-def prepare_data_paths(data_dir, num_labeled=2, num_validation=63):
+# Create a TensorFlow distributed strategy that works with or without GPUs
+def create_strategy():
+    """Create a TensorFlow distributed strategy that works even with detection issues"""
+    gpus = tf.config.list_physical_devices('GPU')
+    
+    if gpus:
+        try:
+            return tf.distribute.MirroredStrategy()
+        except:
+            logger.warning("Could not create MirroredStrategy, falling back to default strategy")
+            return tf.distribute.get_strategy()
+    
+    # Try direct GPU access
+    try:
+        with tf.device('/device:GPU:0'):
+            a = tf.constant(1)
+            _ = a.numpy()
+        return tf.distribute.OneDeviceStrategy(device="/device:GPU:0")
+    except:
+        logger.warning("Using default strategy with CPU")
+        return tf.distribute.get_strategy()
+
+def prepare_data_paths(data_dir, num_labeled=60, num_validation=63):
     print("Finding data pairs...")
     all_image_paths = []
     all_label_paths = []
@@ -129,13 +189,13 @@ class StableDiceLoss(tf.keras.losses.Loss):
 
 
 class StableSSLTrainer:
-    def __init__(self, config, labeled_data_size=2):
+    def __init__(self, config, data_pipeline=None, labeled_data_size=2):
         print("Initializing StableSSLTrainer...")
         self.config = config
         self.labeled_data_size = labeled_data_size
         
         # Initialize data pipeline
-        self.data_pipeline = DataPipeline(config)
+        self.data_pipeline = data_pipeline if data_pipeline else DataPipeline(config)
         
         # Initialize models
         self.student_model = PancreasSeg(config)
@@ -165,6 +225,9 @@ class StableSSLTrainer:
             'consistency_loss': []
         }
         
+        # Add patience attribute for early stopping
+        self.patience = 20
+        
         print("Initialization complete!")
 
     def setup_directories(self):
@@ -184,17 +247,7 @@ class StableSSLTrainer:
         initial_lr = 1e-4
         max_lr = 1e-4
         
-        def lr_schedule(step):
-            warmup_steps = 2000
-            step = tf.cast(step, tf.float32)
-            lr = tf.cond(
-                step < warmup_steps,
-                lambda: initial_lr + (max_lr - initial_lr) * (step / warmup_steps) if max_lr > initial_lr else initial_lr,
-                lambda: max_lr * tf.math.exp(-0.1 * (step - warmup_steps) / 1000)
-            )
-            return lr
-        
-         # CosineDecayRestarts schedule
+        # CosineDecayRestarts schedule - fix by converting to float value
         self.lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
             initial_learning_rate=initial_lr,
             first_decay_steps=500,  # Adjust based on your dataset size
@@ -202,8 +255,9 @@ class StableSSLTrainer:
             m_mul=0.9,
             alpha=0.0,
         )
-        #self.lr_schedule = lr_schedule
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr_schedule(0))
+        
+        # Create optimizer with initial float value instead of scheduled value
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=float(initial_lr))
         
         # Loss function with larger smooth factor
         self.supervised_loss_fn = StableDiceLoss(smooth=10.0)
@@ -1083,11 +1137,17 @@ class HighPerformanceSSLTrainer(ImprovedSSLTrainer):
         return save_dir    
 ############################################
 class MixMatchTrainer(ImprovedSSLTrainer):
-    def __init__(self, config, labeled_data_size=2):
+    def __init__(self, config, data_pipeline=None, labeled_data_size=2):
+        # Call parent constructor but override data_pipeline
         super().__init__(config, labeled_data_size)
-        self.T = 0.5
-        self.K = 2
-        self.alpha = 0.75
+        
+        # Override data_pipeline if provided
+        if data_pipeline is not None:
+            self.data_pipeline = data_pipeline
+            
+        self.T = 0.5  # Sharpening temperature
+        self.K = 2    # Number of augmentations
+        self.alpha = 0.75  # Beta distribution parameter
         
         # Initialize history correctly
         self.history = {
@@ -1397,4 +1457,263 @@ class MixMatchTrainer(ImprovedSSLTrainer):
                 self.plot_progress()
         
         print(f"\nTraining completed! Best validation Dice: {best_dice:.4f}")
+
+# Add the SupervisedTrainer class after the existing trainer classes
+class SupervisedTrainer:
+    def __init__(self, config, data_pipeline=None, labeled_data_size=2):
+        print("Initializing SupervisedTrainer...")
+        self.config = config
+        self.labeled_data_size = labeled_data_size
+        
+        # Initialize data pipeline
+        self.data_pipeline = data_pipeline if data_pipeline else DataPipeline(config)
+        
+        # Initialize model - single model for supervised learning
+        self.model = PancreasSeg(config)
+        
+        # Initialize with dummy input
+        dummy_input = tf.zeros((1, config.img_size_x, config.img_size_y, config.num_channels))
+        _ = self.model(dummy_input)
+        
+        # Setup training parameters
+        self._setup_training_params()
+        
+        # Setup directories
+        self.setup_directories()
+        
+        # Initialize history
+        self.history = {
+            'train_loss': [],
+            'val_dice': [],
+            'learning_rate': []
+        }
+        
+        # Add patience attribute for early stopping
+        self.patience = 20
+        
+        print("Initialization complete!")
+
+    def setup_directories(self):
+        """Setup output directories"""
+        self.output_dir = Path('supervised_results')
+        self.checkpoint_dir = self.output_dir / 'checkpoints'
+        self.plot_dir = self.output_dir / 'plots'
+        
+        # Create directories if they don't exist
+        self.output_dir.mkdir(exist_ok=True)
+        self.checkpoint_dir.mkdir(exist_ok=True)
+        self.plot_dir.mkdir(exist_ok=True)
+
+    def _setup_training_params(self):
+        """Setup training parameters"""
+        # Initial learning rate
+        initial_lr = 1e-4
+        
+        # Cosine decay learning rate schedule
+        self.lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+            initial_learning_rate=initial_lr,
+            first_decay_steps=500,
+            t_mul=2.0,
+            m_mul=0.9,
+            alpha=0.0,
+        )
+        
+        # Create optimizer with initial float value
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=float(initial_lr))
+        
+        # Loss function
+        self.loss_fn = StableDiceLoss(smooth=10.0)
+
+    def train_step(self, batch):
+        images, labels = batch
+
+        images = tf.cast(images, tf.float32)
+        labels = tf.cast(labels, tf.float32)
+    
+        # Z-score normalization
+        mean = tf.reduce_mean(images)
+        std = tf.math.reduce_std(images) + 1e-6
+        images = (images - mean) / std
+
+        with tf.GradientTape() as tape:
+            # Get predictions
+            logits = self.model(images, training=True)
+            
+            # Calculate loss
+            loss = self.loss_fn(labels, logits)
+            
+            # Scale loss for numerical stability
+            scaled_loss = loss * 0.1
+
+        # Compute and apply gradients
+        gradients = tape.gradient(scaled_loss, self.model.trainable_variables)
+        gradients = [tf.clip_by_norm(g, 1.0) for g in gradients]
+
+        # Update model
+        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+
+        # Print debug info occasionally
+        if self.optimizer.iterations % 100 == 0:
+            tf.print("\nStep:", self.optimizer.iterations)
+            tf.print("Learning rate:", self.optimizer.learning_rate)
+            tf.print("Loss:", loss)
+
+        return {
+            'loss': loss
+        }
+
+    def _compute_dice(self, y_true, y_pred):
+        """Compute Dice score"""
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        
+        if len(y_true.shape) > 3:
+            y_true = y_true[..., -1]
+            y_pred = y_pred[..., -1]
+        
+        y_pred = tf.nn.sigmoid(y_pred)
+        y_pred = tf.cast(y_pred > 0.5, tf.float32)
+        
+        intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2])
+        sum_true = tf.reduce_sum(y_true, axis=[1, 2])
+        sum_pred = tf.reduce_sum(y_pred, axis=[1, 2])
+        
+        dice = (2. * intersection + 1e-6) / (sum_true + sum_pred + 1e-6)
+        dice = tf.where(tf.math.is_nan(dice), tf.zeros_like(dice), dice)
+        
+        return tf.reduce_mean(dice)
+
+    def validate(self, val_dataset):
+        """Run validation"""
+        dice_scores = []
+        
+        for batch in val_dataset:
+            images, labels = batch
+            
+            logits = self.model(images, training=False)
+            
+            dice = self._compute_dice(labels, logits)
+            
+            if not tf.math.is_nan(dice):
+                dice_scores.append(float(dice))
+        
+        if dice_scores:
+            return np.mean(dice_scores)
+        return 0.0
+
+    def train(self, data_paths):
+        """Main training loop"""
+        print("\nStarting supervised training...")
+        
+        train_ds = self.data_pipeline.dataloader.create_dataset(
+            data_paths['labeled']['images'],
+            data_paths['labeled']['labels'],
+            batch_size=self.config.batch_size,
+            shuffle=True
+        )
+        
+        val_ds = self.data_pipeline.dataloader.create_dataset(
+            data_paths['validation']['images'],
+            data_paths['validation']['labels'],
+            batch_size=self.config.batch_size,
+            shuffle=False
+        )
+        
+        best_dice = 0
+        patience_counter = 0
+
+        for epoch in range(self.config.num_epochs):
+            epoch_start = time.time()
+
+            # Training
+            epoch_losses = []
+
+            for batch in train_ds:
+                metrics = self.train_step(batch)
+                epoch_losses.append(float(metrics['loss']))
+
+            # Validation
+            val_dice = self.validate(val_ds)
+
+            # Update history
+            self.history['train_loss'].append(np.mean(epoch_losses))
+            self.history['val_dice'].append(val_dice)
+            self.history['learning_rate'].append(
+                float(self.lr_schedule(self.optimizer.iterations))
+            )
+
+            # Logging
+            print(f"Epoch {epoch+1}/{self.config.num_epochs}")
+            print(f"Time: {time.time() - epoch_start:.2f}s | "
+                  f"Loss: {np.mean(epoch_losses):.4f} | "
+                  f"Val Dice: {val_dice:.4f}")
+
+            # Save best model
+            if val_dice > best_dice:
+                best_dice = val_dice
+                self.save_checkpoint('best_model')
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            # Early stopping
+            if patience_counter >= self.patience:
+                print("\nEarly stopping triggered!")
+                break
+
+            # Plot progress
+            if (epoch + 1) % 5 == 0:
+                self.plot_progress()
+
+        print(f"\nTraining completed! Best validation Dice: {best_dice:.4f}")
+        
+        # Save final plots
+        self.plot_final_results()
+        
+        return best_dice
+
+    def save_checkpoint(self, name):
+        """Save model checkpoint"""
+        try:
+            model_path = self.checkpoint_dir / f'{name}'
+            
+            self.model.save_weights(str(model_path))
+            print(f"Saved checkpoint: {name}")
+        except Exception as e:
+            print(f"Error saving checkpoint: {e}")
+
+    def plot_progress(self):
+        """Plot training progress"""
+        plt.style.use('default')
+        fig, axes = plt.subplots(2, 1, figsize=(15, 10))
+        
+        # Plot loss
+        ax = axes[0]
+        ax.plot(self.history['train_loss'], label='Loss')
+        ax.set_title('Training Loss')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.legend()
+        
+        # Plot Dice score
+        ax = axes[1]
+        ax.plot(self.history['val_dice'], label='Validation Dice')
+        ax.set_title('Validation Dice Score')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Dice Score')
+        ax.legend()
+        
+        plt.tight_layout()
+        plt.savefig(self.plot_dir / f'training_progress_{len(self.history["train_loss"])}.png')
+        plt.close()
+
+    def plot_final_results(self):
+        """Create final training summary plots"""
+        self.plot_progress()  # Save final progress plot
+        
+        # Save history to CSV
+        import pandas as pd
+        history_df = pd.DataFrame(self.history)
+        history_df.to_csv(self.output_dir / 'training_history.csv', index=False)
+        print(f"Saved training history to {self.output_dir / 'training_history.csv'}")
 

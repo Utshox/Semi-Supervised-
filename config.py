@@ -113,20 +113,20 @@ class StableSSLConfig:
     """Configuration optimized for stable SSL training"""
     
     # Data parameters
-    img_size_x: int = 256
-    img_size_y: int = 256
+    img_size_x: int = 512  # Updated to your desired size
+    img_size_y: int = 512  # Updated to your desired size
     num_channels: int = 1
     num_classes: int = 2
-    batch_size: int = 16  # Reduced batch size for stability
+    batch_size: int = 4  # Reduced batch size to prevent OOM errors
     
     # Model architecture
-    initial_filters: int = 32
+    initial_filters: int = 16  # Reduced number of initial filters
     dropout_rate: float = 0.2
     use_batch_norm: bool = True
     
     # Training parameters
     num_epochs: int = 100
-    initial_learning_rate: float = 0.00001
+    initial_learning_rate: float = 0.0001
     min_learning_rate: float = 1e-6
     warmup_epochs: int = 5
     
@@ -144,13 +144,14 @@ class StableSSLConfig:
     early_stopping_patience: int = 20
     min_delta: float = 0.001
     
+    # Memory optimization
+    use_mixed_precision: bool = True  # Enable mixed precision for memory efficiency
+    memory_growth: bool = True  # Enable memory growth
+    
     # Augmentation parameters
     noise_std: float = 0.1
     rotation_range: float = 15
     zoom_range: float = 0.1
-    
-
-
     
     # Paths
     checkpoint_dir: Path = Path('ssl_checkpoints')
@@ -173,15 +174,11 @@ class StableSSLConfig:
         """Calculate total steps for consistency loss ramp-up"""
         return self.consistency_rampup_epochs * self.training_steps_per_epoch
 
-
-    def __post_init__(self):
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-  
     @property
     def model_config(self):
         """Get model-specific configuration"""
         return {
-            'filters': self.filters,
+            'initial_filters': self.initial_filters,
             'dropout_rate': self.dropout_rate,
             'use_batch_norm': self.use_batch_norm,
             'num_classes': self.num_classes
@@ -192,8 +189,7 @@ class StableSSLConfig:
         """Get training-specific configuration"""
         return {
             'batch_size': self.batch_size,
-            'learning_rate': self.learning_rate,
-            'weight_decay': self.weight_decay,
+            'initial_learning_rate': self.initial_learning_rate,
             'num_epochs': self.num_epochs
         }
 
@@ -202,9 +198,6 @@ class StableSSLConfig:
         """Get data augmentation configuration"""
         return {
             'rotation_range': self.rotation_range,
-            'scale_range': self.scale_range,
-            'brightness_range': self.brightness_range,
-            'contrast_range': self.contrast_range,
-            'elastic_deform_sigma': self.elastic_deform_sigma,
-            'elastic_deform_alpha': self.elastic_deform_alpha
+            'zoom_range': self.zoom_range,
+            'noise_std': self.noise_std
         }

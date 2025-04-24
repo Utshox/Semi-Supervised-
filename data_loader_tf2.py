@@ -1,38 +1,46 @@
 import tensorflow as tf
 import numpy as np
 from pathlib import Path
-import nibabel as nib  # You might not need this if you are not using .nii files
+import nibabel as nib  # For medical image formats
 import time
 import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class PancreasDataLoader:
     def __init__(self, config):
         self.config = config
         self.target_size = (config.img_size_x, config.img_size_y)
+        logging.info(f"Initialized PancreasDataLoader with target size: {self.target_size}")
 
     def preprocess_volume(self, image_path, label_path=None):
-        """Loads and preprocesses a single volume."""
+        """Loads and preprocesses a single volume using robust methods for latest NumPy."""
         try:
-            # Load image
-            img_data = np.load(str(image_path))
+            # Load image with explicit allow_pickle for NumPy compatibility
+            img_data = np.load(str(image_path), allow_pickle=True)
+            img_data = np.asarray(img_data)  # Ensure it's a NumPy array for 1.26+ compatibility
 
-            # Normalize intensity between 0 and 1
+            # Normalize intensity between 0 and 1 with robust computation
+            # Use float32 explicitly for better performance
+            img_data = img_data.astype(np.float32)
             p1, p99 = np.percentile(img_data, (1, 99))
             img_data = np.clip(img_data, p1, p99)
-            img_data = (img_data - p1) / (p99 - p1)
+            img_data = (img_data - p1) / max((p99 - p1), 1e-8)  # Avoid division by zero
 
             # Process label if provided
             if label_path:
                 try:
-                    label_data = np.load(str(label_path))
+                    label_data = np.load(str(label_path), allow_pickle=True)
+                    label_data = np.asarray(label_data)  # Ensure it's a NumPy array
                     label_data = (label_data > 0).astype(np.float32)
-                    print(f"Successfully loaded and preprocessed {image_path} and {label_path}")
+                    logging.info(f"Successfully loaded and preprocessed {image_path} and {label_path}")
                     return img_data, label_data
                 except Exception as e:
                     logging.error(f"Error processing label {label_path}: {e}")
                     return None, None
             else:
-                print(f"Successfully loaded and preprocessed {image_path}")
+                logging.info(f"Successfully loaded and preprocessed {image_path}")
                 return img_data
 
         except FileNotFoundError:
@@ -91,49 +99,45 @@ class PancreasDataLoader:
 
     @tf.function
     def augment(self, image, label=None, training=True):
-        """Data augmentation function."""
+        """Data augmentation function fully compatible with TF autograph."""
         if not training:
-            if label is not None:
-                return image, label
-            return image
-
-        # Ensure image is a tensor
-        image = tf.convert_to_tensor(image)
-        if label is not None:
-            label = tf.convert_to_tensor(label)
-
-        # Random rotation (using tf.image instead of tfa)
-        if tf.random.uniform(()) > 0.3: # Apply with 70% probability
-            angle = tf.random.uniform((), minval=-20, maxval=20) * np.pi / 180  # Increased rotation range
-            image = tf.image.rot90(image, k=tf.cast(angle / (np.pi / 2), tf.int32))
-            if label is not None:
-                label = tf.image.rot90(label, k=tf.cast(angle / (np.pi / 2), tf.int32))
-
+            # For inference/validation, just return the inputs
+            return image if label is None else (image, label)
+        
+        # Convert inputs to tensors
+        image = tf.convert_to_tensor(image, dtype=tf.float32)
+        has_label = label is not None
+        
+        if has_label:
+            label = tf.convert_to_tensor(label, dtype=tf.float32)
+        
+        # Random rotation - safer implementation
+        if tf.random.uniform(()) > 0.3:  # Apply with 70% probability
+            # Use k=1 for 90 degrees, k=2 for 180 degrees, k=3 for 270 degrees
+            k = tf.random.uniform((), minval=0, maxval=4, dtype=tf.int32)
+            image = tf.image.rot90(image, k=k)
+            if has_label:
+                label = tf.image.rot90(label, k=k)
+        
         # Random flip
         if tf.random.uniform(()) > 0.5:
             image = tf.image.flip_left_right(image)
-            if label is not None:
+            if has_label:
                 label = tf.image.flip_left_right(label)
-
+        
         # Random brightness/contrast (only apply to image)
         if tf.random.uniform(()) > 0.3:  # Apply with 70% probability
             image = tf.image.random_brightness(image, max_delta=0.2)
             image = tf.image.random_contrast(image, lower=0.7, upper=1.3)
-
-        # Random zoom and shift (only apply if label is not None)
-        if label is not None:
-            if tf.random.uniform(()) > 0.3:  # Apply with 70% probability
-                image, label = self.random_zoom(image, label, zoom_range=(0.7, 1.3))  # Increased zoom range
-
-            if tf.random.uniform(()) > 0.3:  # Apply with 70% probability
-                image, label = self.random_shift(image, label, shift_range=0.2)  # Increased shift range
-
+        
         # Ensure values are in valid range
         image = tf.clip_by_value(image, 0.0, 1.0)
-
-        if label is not None:
+        
+        # Return the appropriate result based on whether we have a label
+        if has_label:
             return image, label
-        return image
+        else:
+            return image
 
      # Helper functions for zoom and shift (modified to handle cases where label is None)
     def random_zoom(self, image, label, zoom_range=(0.7, 1.3)):
@@ -174,6 +178,28 @@ class PancreasDataLoader:
           return shifted_image, shifted_label
         else:
           return shifted_image, None        
+
+    def random_zoom_image_only(self, image, zoom_range=(0.7, 1.3)):
+        """Randomly zooms the image only (for unlabeled data)."""
+        zoom_factor = tf.random.uniform((), minval=zoom_range[0], maxval=zoom_range[1])
+        image_shape = tf.shape(image)
+
+        # Resize the image using the zoom factor
+        zoomed_image = tf.image.resize(image, (tf.cast(tf.cast(image_shape[0], tf.float32) * zoom_factor, tf.int32),
+                                              tf.cast(tf.cast(image_shape[1], tf.float32) * zoom_factor, tf.int32)))
+
+        # Crop or pad the zoomed image to the original size
+        image = tf.image.resize_with_crop_or_pad(zoomed_image, image_shape[0], image_shape[1])
+        return image
+
+    def random_shift_image_only(self, image, shift_range=0.1):
+        """Randomly shifts the image only (for unlabeled data)."""
+        shift_x = tf.random.uniform((), minval=-shift_range, maxval=shift_range) * tf.cast(self.config.img_size_x, tf.float32)
+        shift_y = tf.random.uniform((), minval=-shift_range, maxval=shift_range) * tf.cast(self.config.img_size_y, tf.float32)
+
+        # Shift the image
+        shifted_image = tf.roll(image, shift=[tf.cast(shift_x, tf.int32), tf.cast(shift_y, tf.int32)], axis=[0, 1])
+        return shifted_image
 
     def create_dataset(self, image_paths, label_paths=None, batch_size=8, shuffle=True, augment=True, cache=True):
         """Creates a TensorFlow dataset from image and label paths with caching."""
@@ -392,14 +418,15 @@ class PancreasDataLoader:
         # Set shape after unbatching
         dataset = dataset.map(lambda x: tf.ensure_shape(x, [self.config.img_size_x, self.config.img_size_y, 1]), num_parallel_calls=tf.data.AUTOTUNE)
 
-        # Apply augmentation to each slice (without label)
+        # Apply augmentation to each slice using image-only augmentation
+        # Modification: Use a lambda that only passes a single argument
         dataset = dataset.map(
-            lambda x: self.augment(x, training=True),  # Removed label argument
+            lambda x: self.augment_unlabeled(x),
             num_parallel_calls=tf.data.AUTOTUNE
         )
 
         # Resize to target size and add channel dimension (after augmentation)
-        def resize_and_add_channel(image):  # Removed label argument
+        def resize_and_add_channel(image):
             image = tf.image.resize(image, [self.config.img_size_x, self.config.img_size_y])
             return image
 
@@ -413,6 +440,34 @@ class PancreasDataLoader:
         dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
         return dataset
+        
+    @tf.function
+    def augment_unlabeled(self, image, training=True):
+        """Data augmentation function specifically for unlabeled data."""
+        if not training:
+            return image
+        
+        # Convert inputs to tensors
+        image = tf.convert_to_tensor(image, dtype=tf.float32)
+        
+        # Random rotation
+        if tf.random.uniform(()) > 0.3:  # Apply with 70% probability
+            k = tf.random.uniform((), minval=0, maxval=4, dtype=tf.int32)
+            image = tf.image.rot90(image, k=k)
+        
+        # Random flip
+        if tf.random.uniform(()) > 0.5:
+            image = tf.image.flip_left_right(image)
+        
+        # Random brightness/contrast
+        if tf.random.uniform(()) > 0.3:  # Apply with 70% probability
+            image = tf.image.random_brightness(image, max_delta=0.2)
+            image = tf.image.random_contrast(image, lower=0.7, upper=1.3)
+        
+        # Ensure values are in valid range
+        image = tf.clip_by_value(image, 0.0, 1.0)
+        
+        return image
     
     @tf.function
     def elastic_deformation(self, image, label=None, alpha=500, sigma=20):

@@ -1,15 +1,15 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 import numpy as np
+
 class UNetBlock(layers.Layer):
     """
-    Basic U-Net convolutional block with batch normalization
+    Basic U-Net convolutional block with batch normalization and modern activation
     """
-class UNetBlock(layers.Layer):
-    """Basic U-Net convolutional block with batch normalization"""
-    def __init__(self, filters, name='unet_block', **kwargs):
+    def __init__(self, filters, name='unet_block', activation='relu', **kwargs):
         super(UNetBlock, self).__init__(name=name, **kwargs)
         self.filters = filters
+        self.activation_type = activation
 
         # First convolution
         self.conv1 = layers.Conv2D(
@@ -30,22 +30,33 @@ class UNetBlock(layers.Layer):
             name=f'{name}_conv2'
         )
         self.bn2 = layers.BatchNormalization(name=f'{name}_bn2')
+        
+        # Use modern activation options
+        if activation == 'relu':
+            self.activation = tf.nn.relu
+        elif activation == 'leaky_relu':
+            self.activation = lambda x: tf.nn.leaky_relu(x, alpha=0.2)
+        elif activation == 'gelu':
+            self.activation = lambda x: tf.nn.gelu(x)
+        else:
+            self.activation = tf.nn.relu  # Default fallback
 
     def call(self, inputs, training=False):
         x = self.conv1(inputs)
         x = self.bn1(x, training=training)
-        x = tf.nn.relu(x)
+        x = self.activation(x)
 
         x = self.conv2(x)
         x = self.bn2(x, training=training)
-        x = tf.nn.relu(x)
+        x = self.activation(x)
 
         return x
 
     def get_config(self):
         config = super().get_config()
         config.update({
-            "filters": self.filters
+            "filters": self.filters,
+            "activation_type": self.activation_type
         })
         return config
 
