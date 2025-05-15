@@ -1,1108 +1,402 @@
 import tensorflow as tf
 import numpy as np
 from pathlib import Path
-import nibabel as nib  # You might not need this if you are not using .nii files
+import nibabel as nib
 import time
 import logging
-import sys  # Import sys for stderr
+import sys
 import math
 
 # Define AUTOTUNE for tf.data
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 
+# data_loader_tf2.py
+
+# ... (imports and other class/functions remain the same) ...
+
+# data_loader_tf2.py
+
+# ... (imports and other class/functions remain the same) ...
+
 class PancreasDataLoader:
     def __init__(self, config):
         self.config = config
-        # Use config for target size, ensure y (height) is first, then x (width)
-        self.target_size = (config.img_size_y, config.img_size_x)
+        self.target_size_hw = (config.img_size_y, config.img_size_x) # (Height, Width)
 
-    def preprocess_volume(self, image_path, label_path=None):
-        """Loads and preprocesses a single volume.
-        Assumes input .npy files are (Depth, Height, Width).
-        Outputs volumes as (Depth, Height, Width)."""
+# ... (imports and PancreasDataLoader.__init__ remain the same) ...
+
+    def preprocess_volume(self, image_path_str_py, label_path_str_py=None):
+        # tf.print(f"DEBUG PDL.preprocess_volume: START. Image: '{image_path_str_py}', Label: '{label_path_str_py}'", output_stream=sys.stderr)
+
         try:
-            # Load the image data
-            img_data = np.load(str(image_path))  # Expected shape (D, H, W)
-            
-            # Handle NaN values
-            img_data = np.nan_to_num(img_data)
-            
-            # Normalize image to [0,1] range if not already normalized
-            if img_data.max() > 1.0:
-                img_data = (img_data - img_data.min()) / (img_data.max() - img_data.min())
-            
-            img_data = tf.convert_to_tensor(img_data, dtype=tf.float32)
-            
-            # Get dimensions
-            shape = tf.shape(img_data)
-            num_slices = shape[0]
-            target_h, target_w = self.target_size
-            
-            # Process each slice
-            processed_slices = []
-            for i in range(num_slices):
-                slice_2d = img_data[i]  # No need for :, : with TF
-                current_shape = tf.shape(slice_2d)
+            if not Path(image_path_str_py).exists():
+                tf.print(f"ERROR PDL.preprocess_volume: Image file NOT FOUND: '{image_path_str_py}'", output_stream=sys.stderr)
+                return None if label_path_str_py is None else (None, None)
+
+            raw_img_data = np.load(image_path_str_py)
+            # tf.print(f"DEBUG PDL.preprocess_volume: Loaded img '{Path(image_path_str_py).name}', raw_shape: {raw_img_data.shape}, raw_dtype: {raw_img_data.dtype}", output_stream=sys.stderr)
+
+            img_slices_list_hw = []
+            if raw_img_data.ndim == 2:
+                img_slices_list_hw.append(raw_img_data)
+            elif raw_img_data.ndim == 3:
+                if raw_img_data.shape[0] == 1 and raw_img_data.shape[1] > 1 and raw_img_data.shape[2] > 1 : # (1, H, W)
+                    img_slices_list_hw.append(raw_img_data[0])
+                elif raw_img_data.shape[-1] == 1 and raw_img_data.shape[0] > 1 and raw_img_data.shape[1] > 1: # (H, W, 1)
+                    img_slices_list_hw.append(np.squeeze(raw_img_data, axis=-1))
+                elif raw_img_data.shape[0] > 1 and raw_img_data.shape[1] > 1 and raw_img_data.shape[2] > 1: # Assume (D, H, W)
+                    for i in range(raw_img_data.shape[0]):
+                        img_slices_list_hw.append(raw_img_data[i])
+                else: # Other 3D shapes that are problematic (e.g. (256,256,1) interpreted as D=256, H=256, W=1)
+                    tf.print(f"WARNING PDL.preprocess_volume: Image '{Path(image_path_str_py).name}' has ambiguous 3D shape: {raw_img_data.shape}. Attempting to interpret.", output_stream=sys.stderr)
+                    # Heuristic: if one of the dimensions is 1, it's likely channel or a flattened slice dimension
+                    if raw_img_data.shape[0] != 1 and raw_img_data.shape[1] != 1 and raw_img_data.shape[2] == 1 : # (H, W, 1)
+                         img_slices_list_hw.append(np.squeeze(raw_img_data, axis=-1))
+                    elif raw_img_data.shape[0] == 1 and raw_img_data.shape[1] != 1 and raw_img_data.shape[2] != 1 : # (1, H, W)
+                         img_slices_list_hw.append(raw_img_data[0])
+                    else: # Fallback if still ambiguous, treat as D,H,W and hope H,W are reasonable
+                         for i in range(raw_img_data.shape[0]):
+                            img_slices_list_hw.append(raw_img_data[i])
+
+            else:
+                tf.print(f"ERROR PDL.preprocess_volume: Image '{Path(image_path_str_py).name}' has unsupported ndim: {raw_img_data.ndim}. Skipping.", output_stream=sys.stderr)
+                return None if label_path_str_py is None else (None, None)
+
+            if not img_slices_list_hw:
+                tf.print(f"ERROR PDL.preprocess_volume: No valid image slices extracted from '{Path(image_path_str_py).name}'. Skipping.", output_stream=sys.stderr)
+                return None if label_path_str_py is None else (None, None)
+
+            processed_img_volume_slices = []
+            for idx, slice_hw in enumerate(img_slices_list_hw):
+                slice_hw = np.nan_to_num(slice_hw).astype(np.float32)
+                min_val, max_val = slice_hw.min(), slice_hw.max()
+                if max_val > min_val: slice_hw = (slice_hw - min_val) / (max_val - min_val)
+                else: slice_hw = np.zeros_like(slice_hw)
                 
-                # Resize if needed
-                if current_shape[0] != target_h or current_shape[1] != target_w:
-                    # Add channel dim for resize, then remove
-                    resized = tf.image.resize(
-                        slice_2d[..., tf.newaxis],
-                        [target_h, target_w],
-                        method='bilinear'
-                    )
-                    resized = tf.squeeze(resized, axis=-1)
-                else:
-                    resized = slice_2d
-                    
-                processed_slices.append(resized)
-            
-            # Stack all processed slices
-            final_img_data = tf.stack(processed_slices, axis=0)
-            
-            # Handle label if provided
-            if label_path:
+                slice_h_w_c = slice_hw[..., np.newaxis]
+                
+                # Defensive resize: use tf.image.resize (forces to target, may distort)
+                # This avoids the tf.image.resize_with_pad internal errors.
+                # Your preprocess_pancreas_v2.py already aimed to pad to 256x256.
+                # If a slice isn't 256x256 now, it means preprocess_pancreas_v2.py failed for it or produced varied sizes.
+                # Forcing resize here ensures all slices are exactly target_size_hw.
                 try:
-                    # Load and process label
-                    label_data = np.load(str(label_path))  # Expected shape (D, H, W)
-                    
-                    # Handle NaN values in labels
-                    label_data = np.nan_to_num(label_data)
-                    
-                    # Ensure binary labels (0 or 1)
-                    label_data = (label_data > 0.5).astype(np.float32)
-                    
-                    label_data = tf.convert_to_tensor(label_data, dtype=tf.float32)
-                    
-                    label_shape = tf.shape(label_data)
-                    num_label_slices = label_shape[0]
-                    
-                    # Verify label dimensions match image
-                    if num_label_slices != num_slices:
-                        raise ValueError(f"Label slices ({num_label_slices}) don't match image slices ({num_slices})")
-                    
-                    # Process each label slice
-                    processed_label_slices = []
-                    for i in range(num_label_slices):
-                        label_slice = label_data[i]
-                        current_shape = tf.shape(label_slice)
-                        
-                        # Resize if needed using nearest neighbor interpolation for labels
-                        if current_shape[0] != target_h or current_shape[1] != target_w:
-                            resized = tf.image.resize(
-                                label_slice[..., tf.newaxis],
-                                [target_h, target_w],
-                                method='nearest'  # Use nearest neighbor for labels to preserve binary values
-                            )
-                            resized = tf.squeeze(resized, axis=-1)
+                    # tf.print(f"DEBUG PDL.preprocess_volume: Resizing img slice {idx} of {Path(image_path_str_py).name}. Orig shape: {slice_h_w_c.shape}, Target: {self.target_size_hw}", output_stream=sys.stderr)
+                    resized_slice_tf = tf.image.resize(
+                        images=tf.convert_to_tensor(slice_h_w_c, dtype=tf.float32),
+                        size=self.target_size_hw, # [target_height, target_width]
+                        method='bilinear' # or 'nearest' for labels
+                    )
+                    # Ensure shape after resize
+                    resized_slice_tf = tf.ensure_shape(resized_slice_tf, [self.target_size_hw[0], self.target_size_hw[1], 1])
+                    processed_img_volume_slices.append(resized_slice_tf.numpy())
+                except Exception as e_resize: # Broader catch for any resize issue
+                    tf.print(f"ERROR PDL.preprocess_volume: tf.image.resize failed for img slice {idx} of {Path(image_path_str_py).name}. Input shape to resize: {slice_h_w_c.shape}. Error: {str(e_resize)}", output_stream=sys.stderr)
+
+            if not processed_img_volume_slices:
+                 tf.print(f"ERROR PDL.preprocess_volume: No image slices successfully resized for '{image_path_str_py}'", output_stream=sys.stderr)
+                 return None if label_path_str_py is None else (None, None)
+
+            final_img_data_d_th_tw_c = np.stack(processed_img_volume_slices, axis=0)
+            
+            if self.config.num_channels == 1 and final_img_data_d_th_tw_c.shape[-1] != 1:
+                 final_img_data_d_th_tw_c = np.mean(final_img_data_d_th_tw_c, axis=-1, keepdims=True)
+            elif self.config.num_channels == 3 and final_img_data_d_th_tw_c.shape[-1] == 1:
+                 final_img_data_d_th_tw_c = np.repeat(final_img_data_d_th_tw_c, 3, axis=-1)
+
+            final_label_data_d_th_tw_c = None
+            if label_path_str_py:
+                if not Path(label_path_str_py).exists():
+                    tf.print(f"ERROR PDL.preprocess_volume: Label file NOT FOUND: '{label_path_str_py}'", output_stream=sys.stderr)
+                    return None, None 
+
+                raw_label_data = np.load(label_path_str_py)
+                label_slices_list_hw = []
+                if raw_label_data.ndim == 2:
+                    label_slices_list_hw.append(raw_label_data)
+                elif raw_label_data.ndim == 3:
+                    # Similar standardization as for images
+                    if raw_label_data.shape[0] == 1 and raw_label_data.shape[1] > 1 and raw_label_data.shape[2] > 1 : # (1, H, W)
+                        label_slices_list_hw.append(raw_label_data[0])
+                    elif raw_label_data.shape[-1] == 1 and raw_label_data.shape[0] > 1 and raw_label_data.shape[1] > 1: # (H, W, 1)
+                        label_slices_list_hw.append(np.squeeze(raw_label_data, axis=-1))
+                    elif raw_label_data.shape[0] > 1 and raw_label_data.shape[1] > 1 and raw_label_data.shape[2] > 1: # Assume (D, H, W)
+                        for i in range(raw_label_data.shape[0]):
+                            label_slices_list_hw.append(raw_label_data[i])
+                    else: # Ambiguous, try to handle (H,W,1) case
+                        if raw_label_data.shape[0] != 1 and raw_label_data.shape[1] != 1 and raw_label_data.shape[2] == 1 : # (H, W, 1)
+                            label_slices_list_hw.append(np.squeeze(raw_label_data, axis=-1))
+                        elif raw_label_data.shape[0] == 1 and raw_label_data.shape[1] != 1 and raw_label_data.shape[2] != 1 : # (1, H, W)
+                            label_slices_list_hw.append(raw_label_data[0])
                         else:
-                            resized = label_slice
-                            
-                        # Re-binarize after resize to ensure binary values
-                        resized = tf.cast(resized > 0.5, tf.float32)
-                        processed_label_slices.append(resized)
-                    
-                    # Stack all processed label slices
-                    final_label_data = tf.stack(processed_label_slices, axis=0)
-                    
-                    # Add debug output for label stats
-                    tf.print("DEBUG Preprocess Volume: Label stats - ",
-                            "sum:", tf.reduce_sum(final_label_data),
-                            "min:", tf.reduce_min(final_label_data),
-                            "max:", tf.reduce_max(final_label_data),
-                            "shape:", tf.shape(final_label_data),
-                            "unique values:", tf.unique(tf.reshape(final_label_data, [-1])),
-                            output_stream=sys.stderr)
-                    
-                    # Final sanity check on label values
-                    if tf.reduce_max(final_label_data) <= 0:
-                        tf.print("WARNING: All-zero label detected!", output_stream=sys.stderr)
-                    
-                    return final_img_data, final_label_data
-                    
-                except Exception as e:
-                    tf.print(f"ERROR processing label {label_path}: {str(e)}", output_stream=sys.stderr)
+                             for i in range(raw_label_data.shape[0]):
+                                label_slices_list_hw.append(raw_label_data[i])
+                else:
+                    tf.print(f"ERROR PDL.preprocess_volume: Label '{Path(label_path_str_py).name}' has unsupported ndim: {raw_label_data.ndim}. Skipping.", output_stream=sys.stderr)
                     return None, None
-            else:
-                return final_img_data
                 
+                if not label_slices_list_hw:
+                    tf.print(f"ERROR PDL.preprocess_volume: No valid label slices extracted from '{Path(label_path_str_py).name}'. Skipping.", output_stream=sys.stderr)
+                    return None, None
+
+                processed_label_volume_slices = []
+                for idx, slice_hw in enumerate(label_slices_list_hw):
+                    slice_hw = np.nan_to_num(slice_hw)
+                    slice_hw = (slice_hw > 0.5).astype(np.float32)
+                    slice_h_w_c = slice_hw[..., np.newaxis]
+                    try:
+                        resized_slice_tf = tf.image.resize(
+                            images=tf.convert_to_tensor(slice_h_w_c, dtype=tf.float32),
+                            size=self.target_size_hw,
+                            method='nearest' # Use nearest for labels
+                        )
+                        resized_slice_tf = tf.ensure_shape(resized_slice_tf, [self.target_size_hw[0], self.target_size_hw[1], 1])
+                        processed_label_volume_slices.append(resized_slice_tf.numpy())
+                    except Exception as e_resize:
+                        tf.print(f"ERROR PDL.preprocess_volume: tf.image.resize failed for lbl slice {idx} of {Path(label_path_str_py).name}. Input shape to resize: {slice_h_w_c.shape}. Error: {str(e_resize)}", output_stream=sys.stderr)
+
+
+                if not processed_label_volume_slices:
+                    tf.print(f"ERROR PDL.preprocess_volume: No label slices successfully resized for '{label_path_str_py}'", output_stream=sys.stderr)
+                    return None, None
+                
+                final_label_data_d_th_tw_c = np.stack(processed_label_volume_slices, axis=0)
+                final_label_data_d_th_tw_c = (final_label_data_d_th_tw_c > 0.5).astype(np.float32)
+
+                min_successful_slices = min(len(processed_img_volume_slices), len(processed_label_volume_slices))
+                if min_successful_slices == 0:
+                    tf.print(f"ERROR PDL.preprocess_volume: Zero successful slices for img or label after resize for '{Path(image_path_str_py).name}'.", output_stream=sys.stderr)
+                    return None, None
+                
+                final_img_data_d_th_tw_c = final_img_data_d_th_tw_c[:min_successful_slices]
+                final_label_data_d_th_tw_c = final_label_data_d_th_tw_c[:min_successful_slices]
+                
+                return final_img_data_d_th_tw_c, final_label_data_d_th_tw_c
+            else: 
+                if final_img_data_d_th_tw_c.shape[0] == 0:
+                    tf.print(f"ERROR PDL.preprocess_volume: Zero depth for unlabeled img '{Path(image_path_str_py).name}'.", output_stream=sys.stderr)
+                    return None
+                return final_img_data_d_th_tw_c
+
+        except FileNotFoundError as e_fnf: 
+            tf.print(f"FATAL ERROR PDL.preprocess_volume: FileNotFoundError for '{image_path_str_py}' or '{label_path_str_py}': {str(e_fnf)}", output_stream=sys.stderr)
+            return None if label_path_str_py is None else (None, None)
         except Exception as e:
-            tf.print(f"ERROR processing {image_path}: {str(e)}", output_stream=sys.stderr)
-            return None if label_path is None else (None, None)
+            tf.print(f"ERROR PDL.preprocess_volume: Unexpected error for '{image_path_str_py}': {type(e).__name__} - {str(e)}", output_stream=sys.stderr)
+            return None if label_path_str_py is None else (None, None)
 
-    def resize_slice(self, slice_2d):
-        """Resizes a single 2D slice."""
-        if slice_2d is None:
-            return tf.zeros([self.config.img_size_x, self.config.img_size_y, 1], dtype=tf.float32)
-
-        try:
-            # Convert to tensor and add channel dimension if needed
-            slice_2d = tf.convert_to_tensor(slice_2d, dtype=tf.float32)
-            if len(slice_2d.shape) == 2:
-                slice_2d = slice_2d[..., tf.newaxis]
-
-            # Resize
-            resized = tf.image.resize(
-                slice_2d,
-                [self.config.img_size_x, self.config.img_size_y],
-                method='bilinear'
-            )
-            resized.set_shape([self.config.img_size_x, self.config.img_size_y, 1])
-            return resized
-            
-        except Exception as e:
-            logging.error(f"Resize error: {str(e)}")
-            return tf.zeros([self.config.img_size_x, self.config.img_size_y, 1], dtype=tf.float32)
-
-    def resize_volume(self, volume):
-        """Resizes 3D volume slice by slice."""
-        if volume is None:
-            return tf.zeros([self.config.img_size_x, self.config.img_size_y, 1], dtype=tf.float32)
-
-        try:
-            # Convert to tensor
-            volume = tf.convert_to_tensor(volume, dtype=tf.float32)
-            
-            # Handle 2D case
-            if len(volume.shape) == 2:
-                return self.resize_slice(volume)
-
-            # Process each slice in the volume
-            resized_slices = []
-            depth = tf.shape(volume)[2]
-            
-            for i in range(depth):
-                slice_2d = volume[:, :, i]
-                resized = self.resize_slice(slice_2d)
-                if resized is not None:
-                    resized_slices.append(resized)
-
-            if not resized_slices:
-                return tf.zeros([self.config.img_size_x, self.config.img_size_y, 1], dtype=tf.float32)
-
-            # Stack all slices
-            resized_volume = tf.stack(resized_slices, axis=-1)
-            return resized_volume
-            
-        except Exception as e:
-            logging.error(f"Volume resize error: {str(e)}")
-            return tf.zeros([self.config.img_size_x, self.config.img_size_y, 1], dtype=tf.float32)    
-        
-    @tf.function
-    def augment_unlabeled(self, image, training=True):
-        """Data augmentation function for unlabeled images."""
-        if not training:
-            return image
-
-        try:
-            # Convert to tensor if not already
-            image = tf.convert_to_tensor(image)
-            rank = tf.rank(image)
-
-            # For single slice input [H, W, C]
-            if rank == 3:
-                # Process a single 2D slice
-                slice_img = tf.ensure_shape(image, [self.config.img_size_y, self.config.img_size_x, 1])
-                slice_img = tf.cast(slice_img, tf.float32)
-                slice_img = self._augment_single_slice(slice_img)
-                # Add batch dimension [1, H, W, C]
-                return tf.expand_dims(slice_img, axis=0)
-
-            # For volume input [D, H, W, C]
-            elif rank == 4:
-                # Extract first slice if shape is unknown or empty
-                shape = tf.shape(image)
-                if shape[0] == 0:
-                    tf.print("WARNING: Empty volume in augment_unlabeled", output_stream=sys.stderr)
-                    return tf.zeros([1, self.config.img_size_y, self.config.img_size_x, 1], dtype=tf.float32)
-
-                # Process each slice in the volume
-                try:
-                    # Try to unstack volume into slices
-                    slices = tf.unstack(image, axis=0)
-                    processed_slices = []
-                    
-                    for slice_img in slices:
-                        slice_img = tf.ensure_shape(slice_img, [self.config.img_size_y, self.config.img_size_x, 1])
-                        slice_img = tf.cast(slice_img, tf.float32)
-                        slice_img = self._augment_single_slice(slice_img)
-                        processed_slices.append(slice_img)
-
-                    # Stack processed slices if we have any
-                    if len(processed_slices) > 0:
-                        return tf.stack(processed_slices, axis=0)
-                    else:
-                        tf.print("WARNING: No valid slices processed", output_stream=sys.stderr)
-                        return tf.zeros([1, self.config.img_size_y, self.config.img_size_x, 1], dtype=tf.float32)
-
-                except (tf.errors.InvalidArgumentError, ValueError) as e:
-                    tf.print("WARNING: Failed to process volume, falling back to first slice:", e, output_stream=sys.stderr)
-                    # Extract and process first slice as fallback
-                    slice_img = tf.ensure_shape(
-                        tf.slice(image, [0, 0, 0, 0], [1, self.config.img_size_y, self.config.img_size_x, 1]),
-                        [1, self.config.img_size_y, self.config.img_size_x, 1]
-                    )
-                    slice_img = tf.squeeze(slice_img, axis=0)
-                    slice_img = tf.cast(slice_img, tf.float32)
-                    slice_img = self._augment_single_slice(slice_img)
-                    return tf.expand_dims(slice_img, axis=0)
-
-            # Invalid rank, return zero tensor
-            else:
-                tf.print("WARNING: Invalid rank in augment_unlabeled:", rank, output_stream=sys.stderr)
-                return tf.zeros([1, self.config.img_size_y, self.config.img_size_x, 1], dtype=tf.float32)
-
-        except Exception as e:
-            tf.print("ERROR in augment_unlabeled:", str(e), output_stream=sys.stderr)
-            return tf.zeros([1, self.config.img_size_y, self.config.img_size_x, 1], dtype=tf.float32)
-            
-    def _augment_single_slice(self, slice_img):
-        """Helper function to apply augmentations to a single slice."""
-        # Random rotation
-        if tf.random.uniform(()) > 0.3:
-            angle = tf.random.uniform((), minval=-20, maxval=20) * math.pi / 180
-            k = tf.cast(angle / (math.pi/2), tf.int32)
-            slice_img = tf.image.rot90(slice_img, k=k)
-
-        # Random flip
-        if tf.random.uniform(()) > 0.5:
-            slice_img = tf.image.flip_left_right(slice_img)
-
-        # Random brightness/contrast
-        if tf.random.uniform(()) > 0.3:
-            slice_img = tf.image.random_brightness(slice_img, max_delta=0.2)
-            slice_img = tf.image.random_contrast(slice_img, lower=0.7, upper=1.3)
-
-        # Ensure values are in valid range
-        return tf.clip_by_value(slice_img, 0.0, 1.0)
+# ... (rest of DataPipeline and other functions/classes in data_loader_tf2.py remain the same) ...
 
     @tf.function
-    def augment_labeled(self, image, label, training=True):
-        """Augmentation function for labeled data. 
-        Can handle both 2D slices and 3D volumes with batch dimension.
-        """
-        if not training:
-            return image, label
-            
-        def augment_single_slice(img_slice, lbl_slice):
-            """Helper function to augment a single slice."""
-            # Check and fix input shapes
-            img_shape = tf.shape(img_slice)
-            if tf.rank(img_slice) == 2:
-                img_slice = tf.reshape(img_slice, [img_shape[0], self.config.img_size_x, 1])
-            
-            lbl_shape = tf.shape(lbl_slice)
-            if tf.rank(lbl_slice) == 2:
-                lbl_slice = tf.reshape(lbl_slice, [lbl_shape[0], self.config.img_size_x, 1])
-            
-            # Ensure proper shapes and types
-            img_slice = tf.ensure_shape(img_slice, [self.config.img_size_y, self.config.img_size_x, 1])
-            lbl_slice = tf.ensure_shape(lbl_slice, [self.config.img_size_y, self.config.img_size_x, 1])
-            
-            img_slice = tf.cast(img_slice, tf.float32)
-            lbl_slice = tf.cast(lbl_slice, tf.float32)
-            
-            # Random rotation
-            if tf.random.uniform(()) > 0.3:
-                angle = tf.random.uniform((), minval=-20, maxval=20) * (math.pi / 180)
-                k = tf.cast(angle / (math.pi/2), tf.int32)
-                img_slice = tf.image.rot90(img_slice, k=k)
-                lbl_slice = tf.image.rot90(lbl_slice, k=k)
-            
-            # Random flip
-            if tf.random.uniform(()) > 0.5:
-                img_slice = tf.image.flip_left_right(img_slice)
-                lbl_slice = tf.image.flip_left_right(lbl_slice)
-            
-            # Random brightness/contrast (only for image)
-            if tf.random.uniform(()) > 0.3:
-                img_slice = tf.image.random_brightness(img_slice, max_delta=0.2)
-                img_slice = tf.image.random_contrast(img_slice, lower=0.7, upper=1.3)
-            
-            # Ensure proper value ranges
-            img_slice = tf.clip_by_value(img_slice, 0.0, 1.0)
-            lbl_slice = tf.cast(lbl_slice > 0.5, tf.float32)  # Re-binarize label
-            
-            return img_slice, lbl_slice
+    def _augment_slice_and_label(self, image_slice, label_slice, seed_pair):
+        """Applies identical geometric augmentations to image and label slices using stateless random ops."""
+        # image_slice, label_slice: [H, W, C]
         
-        # Convert inputs to proper tensors and ensure correct shape
-        image = tf.convert_to_tensor(image, dtype=tf.float32)
-        label = tf.convert_to_tensor(label, dtype=tf.float32)
-        
-        # Get shape information and handle reshaping if needed
-        shape = tf.shape(image)
-        rank = tf.rank(image)
-        
-        # Fix shapes if needed
-        if rank == 2:
-            image = tf.reshape(image, [shape[0], self.config.img_size_x, 1])
-            label = tf.reshape(label, [shape[0], self.config.img_size_x, 1])
-            rank = 3  # Update rank after reshape
-            shape = tf.shape(image)
-        
-        tf.print("DEBUG augment_labeled - Input:",
-                "shape:", shape,
-                "rank:", rank,
-                "img sum:", tf.reduce_sum(image),
-                "label sum:", tf.reduce_sum(label),
-                output_stream=sys.stderr)
-        
-        # For single slice [H, W, C]
-        if rank == 3:
-            augmented_img, augmented_lbl = augment_single_slice(image, label)
-            return tf.expand_dims(augmented_img, 0), tf.expand_dims(augmented_lbl, 0)
-            
-        # For batched data [B, H, W, C]
-        elif rank == 4:
-            # Use tf.map_fn to avoid InaccessibleTensorError
-            def map_fn_fn(inputs):
-                img_slice, lbl_slice = inputs
-                return augment_single_slice(img_slice, lbl_slice)
-            # Stack images and labels together for map_fn
-            stacked = (image, label)
-            mapped = tf.map_fn(map_fn_fn, stacked, fn_output_signature=(tf.float32, tf.float32))
-            final_image, final_label = mapped
-            tf.print("DEBUG augment_labeled - Output:",
-                    "shape:", tf.shape(final_image),
-                    "img sum:", tf.reduce_sum(final_image),
-                    "label sum:", tf.reduce_sum(final_label),
-                    output_stream=sys.stderr)
-            return final_image, final_label
-            
-        else:
-            tf.print(f"WARNING: Unexpected rank {rank}, returning unaugmented data", output_stream=sys.stderr)
-            return image, label
+        # Ensure correct shapes
+        image_slice = tf.ensure_shape(image_slice, [self.target_size_hw[0], self.target_size_hw[1], self.config.num_channels])
+        label_slice = tf.ensure_shape(label_slice, [self.target_size_hw[0], self.target_size_hw[1], 1]) # Label is single channel
 
-     # Helper functions for zoom and shift (modified to handle cases where label is None)
-    def random_zoom(self, image, label, zoom_range=(0.7, 1.3)):
-        """Randomly zooms the image and label."""
-        zoom_factor = tf.random.uniform((), minval=zoom_range[0], maxval=zoom_range[1])
-        image_shape = tf.shape(image)
-
-        # Resize the image using the zoom factor
-        zoomed_image = tf.image.resize(image, (tf.cast(tf.cast(image_shape[0], tf.float32) * zoom_factor, tf.int32),
-                                              tf.cast(tf.cast(image_shape[1], tf.float32) * zoom_factor, tf.int32)))
-
-        # Crop or pad the zoomed image to the original size
-        image = tf.image.resize_with_crop_or_pad(zoomed_image, image_shape[0], image_shape[1])
-
-        if label is not None:
-            label_shape = tf.shape(label)
-            # Resize the label using the zoom factor (nearest neighbor for labels)
-            zoomed_label = tf.image.resize(label, (tf.cast(tf.cast(label_shape[0], tf.float32) * zoom_factor, tf.int32),
-                                                tf.cast(tf.cast(label_shape[1], tf.float32) * zoom_factor, tf.int32)),
-                                        method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-            # Crop or pad the zoomed label to the original size
-            label = tf.image.resize_with_crop_or_pad(zoomed_label, label_shape[0], label_shape[1])
-            return image, label
-        else:
-            return image, None
-
-    def random_shift(self, image, label, shift_range=0.1):
-        """Randomly shifts the image and label."""
-        shift_x = tf.random.uniform((), minval=-shift_range, maxval=shift_range) * tf.cast(self.config.img_size_x, tf.float32)
-        shift_y = tf.random.uniform((), minval=-shift_range, maxval=shift_range) * tf.cast(self.config.img_size_y, tf.float32)
-
-        # Shift the image
-        shifted_image = tf.roll(image, shift=[tf.cast(shift_x, tf.int32), tf.cast(shift_y, tf.int32)], axis=[0, 1])
-
-        if label is not None:
-          # Shift the label
-          shifted_label = tf.roll(label, shift=[tf.cast(shift_x, tf.int32), tf.cast(shift_y, tf.int32)], axis=[0, 1])
-          return shifted_image, shifted_label
-        else:
-          return shifted_image, None        
-
-    def create_unlabeled_dataset(self, image_paths, batch_size):
-        """Creates an unlabeled dataset from image paths, yielding 2D slices."""
-        tf.print("DEBUG: Setting up UNLABELED dataset", output_stream=sys.stderr)
-        
-        # Convert paths to tensor
-        ds = tf.data.Dataset.from_tensor_slices(image_paths)
-        
-        # Map loading and preprocessing
-        ds = ds.map(
-            lambda x: tf.py_function(
-                func=lambda p: self.preprocess_volume(p.numpy().decode('utf-8')),
-                inp=[x],
-                Tout=tf.float32
-            ),
-            num_parallel_calls=tf.data.AUTOTUNE
-        )
-        
-        # Filter out None values
-        ds = ds.filter(lambda x: tf.reduce_all(tf.shape(x) > 0))
-        
-        # Add channel dimension if not present
-        ds = ds.map(lambda x: tf.expand_dims(x, axis=-1))
-        
-        # Extract 2D slices from each volume
-        def extract_slices(volume):
-            num_slices = tf.shape(volume)[0]
-            slice_ds = tf.data.Dataset.from_tensor_slices(
-                tf.reshape(volume, [num_slices, self.config.img_size_y, self.config.img_size_x, 1])
-            )
-            return slice_ds
-        ds = ds.flat_map(extract_slices)
-        
-        # Batch the dataset
-        ds = ds.batch(batch_size)
-        
-        # Prefetch for performance
-        ds = ds.prefetch(tf.data.AUTOTUNE)
-        
-        return ds
-
-    def create_dataset(self, image_paths, label_paths=None, batch_size=8, shuffle=True, augment=True, cache=True):
-        """Creates a TensorFlow dataset from image and label paths."""
-        
-        # If no labels, create unlabeled dataset
-        if label_paths is None:
-            tf.print("DEBUG: Creating UNLABELED dataset", output_stream=sys.stderr)
-            return self.create_unlabeled_dataset(image_paths, batch_size)
-
-        tf.print("DEBUG: Creating LABELED dataset", output_stream=sys.stderr)
-            
-        # Convert paths to tensors
-        ds = tf.data.Dataset.from_tensor_slices((image_paths, label_paths))
-        
-        # Shuffle early if enabled
-        if shuffle:
-            ds = ds.shuffle(buffer_size=len(image_paths), reshuffle_each_iteration=True)
-        
-        # Map loading and preprocessing
-        ds = ds.map(
-            lambda x, y: tf.py_function(
-                func=lambda img_p, lbl_p: self.preprocess_volume(
-                    img_p.numpy().decode('utf-8'),
-                    lbl_p.numpy().decode('utf-8')
-                ),
-                inp=[x, y],
-                Tout=[tf.float32, tf.float32]
-            ),
-            num_parallel_calls=tf.data.AUTOTUNE
-        )
-        
-        # Filter out None values and check shapes
-        ds = ds.filter(lambda x, y: tf.logical_and(
-            tf.reduce_all(tf.shape(x) > 0),
-            tf.reduce_all(tf.shape(y) > 0)
-        ))
-        
-        # Add channel dimension if not present
-        def add_channel_dim(x, y):
-            x_rank = tf.rank(x)
-            y_rank = tf.rank(y)
-            
-            x = tf.cond(
-                tf.equal(x_rank, 3),
-                lambda: tf.expand_dims(x, axis=-1),
-                lambda: x
-            )
-            y = tf.cond(
-                tf.equal(y_rank, 3),
-                lambda: tf.expand_dims(y, axis=-1),
-                lambda: y
-            )
-            return x, y
-            
-        ds = ds.map(add_channel_dim, num_parallel_calls=tf.data.AUTOTUNE)
-        
-        # Extract slices using tf.data.Dataset.flat_map
-        def extract_slices(volume, label):
-            # Get number of slices
-            num_slices = tf.shape(volume)[0]
-            
-            # Create a dataset from the slices
-            slice_ds = tf.data.Dataset.from_tensor_slices((
-                tf.reshape(volume, [num_slices, self.config.img_size_y, self.config.img_size_x, 1]),
-                tf.reshape(label, [num_slices, self.config.img_size_y, self.config.img_size_x, 1])
-            ))
-            
-            return slice_ds
-            
-        # Flatten the volume into individual slices
-        ds = ds.flat_map(extract_slices)
-        
-        # Cache if enabled (after preprocessing, before augmentation)
-        if cache:
-            ds = ds.cache()
-            
-        # Data augmentation if enabled
-        if augment:
-            ds = ds.map(
-                lambda x, y: self.augment_labeled(x, y, training=True),
-                num_parallel_calls=tf.data.AUTOTUNE
-            )
-        
-        # Add debug output for label stats before batching
-        ds = ds.map(lambda x, y: (
-            x,
-            tf.py_function(
-                func=lambda l: tf.print(
-                    "DEBUG Pre-batch Label Stats:",
-                    "sum:", tf.reduce_sum(l),
-                    "min:", tf.reduce_min(l),
-                    "max:", tf.reduce_max(l),
-                    "shape:", tf.shape(l),
-                    "unique:", tf.unique(tf.reshape(l, [-1])),
-                    output_stream=sys.stderr
-                ) or l,
-                inp=[y],
-                Tout=tf.float32
-            )
-        ))
-        
-        # Batch the dataset
-        ds = ds.batch(batch_size)
-        
-        # Add debug output for label stats after batching
-        ds = ds.map(lambda x, y: (
-            x,
-            tf.py_function(
-                func=lambda l: tf.print(
-                    "DEBUG Post-batch Label Stats:",
-                    "sum:", tf.reduce_sum(l),
-                    "min:", tf.reduce_min(l),
-                    "max:", tf.reduce_max(l),
-                    "shape:", tf.shape(l),
-                    "unique:", tf.unique(tf.reshape(l, [-1])),
-                    output_stream=sys.stderr
-                ) or l,
-                inp=[y],
-                Tout=tf.float32
-            )
-        ))
-        
-        # Prefetch for performance
-        ds = ds.prefetch(tf.data.AUTOTUNE)
-        
-        return ds
-        
-    @tf.function
-    def elastic_deformation(self, image, label=None, alpha=500, sigma=20):
-        """Applies elastic deformation using pure TensorFlow operations."""
-
-        def _bilinear_interpolate(image, x, y):
-            """Performs bilinear interpolation for given coordinates."""
-            x0 = tf.floor(x)
-            x1 = x0 + 1
-            y0 = tf.floor(y)
-            y1 = y0 + 1
-
-            x0 = tf.clip_by_value(x0, 0, tf.cast(self.config.img_size_x - 1, tf.float32))
-            x1 = tf.clip_by_value(x1, 0, tf.cast(self.config.img_size_x - 1, tf.float32))
-            y0 = tf.clip_by_value(y0, 0, tf.cast(self.config.img_size_y - 1, tf.float32))
-            y1 = tf.clip_by_value(y1, 0, tf.cast(self.config.img_size_y - 1, tf.float32))
-
-            x0_int = tf.cast(x0, tf.int32)
-            x1_int = tf.cast(x1, tf.int32)
-            y0_int = tf.cast(y0, tf.int32)
-            y1_int = tf.cast(y1, tf.int32)
-
-            Ia = tf.gather_nd(image, tf.stack([y0_int, x0_int], axis=-1))
-            Ib = tf.gather_nd(image, tf.stack([y1_int, x0_int], axis=-1))
-            Ic = tf.gather_nd(image, tf.stack([y0_int, x1_int], axis=-1))
-            Id = tf.gather_nd(image, tf.stack([y1_int, x1_int], axis=-1))
-
-            wa = (x1 - x) * (y1 - y)
-            wb = (x1 - x) * (y - y0)
-            wc = (x - x0) * (y1 - y)
-            wd = (x - x0) * (y - y0)
-
-            return wa * Ia + wb * Ib + wc * Ic + wd * Id
-
-        image_shape = tf.shape(image)
-        dx = tf.random.normal(image_shape, mean=0.0, stddev=sigma)
-        dy = tf.random.normal(image_shape, mean=0.0, stddev=sigma)
-
-        x, y = tf.meshgrid(tf.range(image_shape[1]), tf.range(image_shape[0]))
-        x = tf.cast(x, tf.float32) + alpha * dx
-        y = tf.cast(y, tf.float32) + alpha * dy
-
-        warped_image = _bilinear_interpolate(image, x, y)
-
-        if label is not None:
-            warped_label = _bilinear_interpolate(label, x, y)
-            return warped_image, warped_label
-
-        return warped_image    
-
-    def _gaussian_kernel(self, sigma, kernel_size=15):
-            """Creates a Gaussian kernel for elastic deformation."""
-            x = tf.range(-kernel_size // 2 + 1, kernel_size // 2 + 1, dtype=tf.float32)
-            g = tf.math.exp(-(x ** 2) / (2 * sigma ** 2))
-            g = g / tf.reduce_sum(g)
-            return tf.reshape(g, [kernel_size, 1, 1, 1])    
-    
-    def _load_and_preprocess_mask(self, mask_path):
-        """Load and preprocess a mask file."""
-        try:
-            # Load mask data
-            mask = np.load(mask_path)
-            # Convert to tensor and ensure float32
-            mask = tf.convert_to_tensor(mask, dtype=tf.float32)
-            # Add channel dimension
-            mask = tf.expand_dims(mask, axis=-1)
-            return mask
-        except Exception as e:
-            logging.error(f"Error loading mask {mask_path}: {e}")
-            return None
-
-    def resize_image_slice(self, slice_2d):
-        # Ensure slice_2d is [H, W, C]
-        if len(slice_2d.shape) == 2: # Grayscale, no channel
-            slice_2d = slice_2d[..., tf.newaxis]
-        
-        # Check if channel dim is missing for grayscale and add it
-        if slice_2d.shape[-1] != self.config.num_channels:
-             if self.config.num_channels == 1 and len(slice_2d.shape) == 2: # H, W
-                 slice_2d = slice_2d[..., tf.newaxis] # H, W, 1
-             # Add more sophisticated channel handling if necessary
-
-        resized = tf.image.resize_with_pad(
-            slice_2d, self.config.img_size_y, self.config.img_size_x, method=tf.image.ResizeMethod.BILINEAR
-        )
-        return resized # Shape [target_y, target_x, C]
-
-    def resize_label_slice(self, slice_2d):
-        # Ensure slice_2d is [H, W, C]
-        if len(slice_2d.shape) == 2: # Grayscale, no channel
-            slice_2d = slice_2d[..., tf.newaxis]
-
-        # Check if channel dim is missing for grayscale and add it
-        if slice_2d.shape[-1] != 1: # Assuming label is single channel
-             if len(slice_2d.shape) == 2: # H, W
-                 slice_2d = slice_2d[..., tf.newaxis] # H, W, 1
-        
-        resized = tf.image.resize_with_pad(
-            slice_2d, self.config.img_size_y, self.config.img_size_x, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR
-        )
-        return tf.cast(resized, tf.float32) # Ensure labels are float for loss calculation if needed, or int
-
-    def resize_volume(self, volume):
-        # ...existing code...
-        # This function might not be directly used if we process slice by slice after loading full volume
-        # However, if used, ensure it handles channels correctly
-        # For labels, it should use NEAREST_NEIGHBOR if it were to resize whole 3D volume labels
-        original_shape = tf.shape(volume) # S, H, W, C
-        num_slices = original_shape[0]
-        
-        resized_slices = []
-        for i in tf.range(num_slices):
-            current_slice = volume[i, :, :, :]
-            if current_slice.shape[-1] != self.config.num_channels: # Ensure correct channels for resize_image_slice
-                if self.config.num_channels == 1 and len(current_slice.shape) == 2:
-                    current_slice = current_slice[..., tf.newaxis]
-                elif current_slice.shape[-1] != self.config.num_channels and len(current_slice.shape) == 3 and current_slice.shape[-1] > 1 and self.config.num_channels == 1:
-                     current_slice = current_slice[..., :1] # Take first channel if multi-channel and config expects 1
-            
-            resized_slice = self.resize_image_slice(current_slice)
-            resized_slices.append(resized_slice)
-        
-        if resized_slices:
-            return tf.stack(resized_slices, axis=0)
-        else: # Handle empty volume case
-            # Return an empty tensor with the correct target shape but 0 slices
-            return tf.zeros([0, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=volume.dtype)
-
-
-    @tf.function
-    def _augment_slice_and_label(self, image_slice, label_slice, seed):
-        """Applies identical geometric augmentations to image and label slices."""
-        # Ensure image_slice and label_slice are [H, W, C]
         # Stateless random flips
-        seed_flip_lr = tf.random.experimental.stateless_split(seed, num=1)[0]
-        image_slice = tf.image.stateless_random_flip_left_right(image_slice, seed=seed_flip_lr)
-        label_slice = tf.image.stateless_random_flip_left_right(label_slice, seed=seed_flip_lr)
+        seed_lr, seed_ud, seed_rot = tf.unstack(tf.random.experimental.stateless_split(seed_pair, num=3))
 
-        seed_flip_ud = tf.random.experimental.stateless_split(seed_flip_lr, num=1)[0] # Chain seeds
-        image_slice = tf.image.stateless_random_flip_up_down(image_slice, seed=seed_flip_ud)
-        label_slice = tf.image.stateless_random_flip_up_down(label_slice, seed=seed_flip_ud)
+        if tf.random.stateless_uniform(shape=[], seed=seed_lr, minval=0, maxval=1) > 0.5:
+            image_slice = tf.image.flip_left_right(image_slice)
+            label_slice = tf.image.flip_left_right(label_slice)
 
+        if tf.random.stateless_uniform(shape=[], seed=seed_ud, minval=0, maxval=1) > 0.5:
+            image_slice = tf.image.flip_up_down(image_slice)
+            label_slice = tf.image.flip_up_down(label_slice)
+        
         # Stateless random 90-degree rotations
-        # tf.image.rot90 takes k (number of 90-degree rotations)
-        # Generate a random k (0, 1, 2, or 3)
-        seed_rot = tf.random.experimental.stateless_split(seed_flip_ud, num=1)[0]
         k_rot = tf.random.stateless_uniform(shape=[], seed=seed_rot, minval=0, maxval=4, dtype=tf.int32)
         image_slice = tf.image.rot90(image_slice, k=k_rot)
         label_slice = tf.image.rot90(label_slice, k=k_rot)
         
-        # Optional: Add stateless random zoom here if a robust TF implementation is available/developed
-        # For now, focusing on flips and rotations.
-
         return image_slice, label_slice
 
     @tf.function
     def _augment_single_image_slice(self, image_slice, strength='weak'):
-        """Applies augmentations to a single image slice."""
-        # Color augmentations (intensity-based)
+        """Applies color/intensity augmentations to a single image slice."""
+        image_slice = tf.ensure_shape(image_slice, [self.target_size_hw[0], self.target_size_hw[1], self.config.num_channels])
+
         if strength == 'weak':
-            image_slice = tf.image.random_brightness(image_slice, max_delta=0.1)
-            image_slice = tf.image.random_contrast(image_slice, lower=0.9, upper=1.1)
+            if tf.random.uniform(shape=[]) > 0.5:
+                 image_slice = tf.image.random_brightness(image_slice, max_delta=0.1)
+            if tf.random.uniform(shape=[]) > 0.5:
+                 image_slice = tf.image.random_contrast(image_slice, lower=0.9, upper=1.1)
         elif strength == 'strong':
-            image_slice = tf.image.random_brightness(image_slice, max_delta=0.2)
-            image_slice = tf.image.random_contrast(image_slice, lower=0.8, upper=1.2)
+            if tf.random.uniform(shape=[]) > 0.5:
+                image_slice = tf.image.random_brightness(image_slice, max_delta=0.2)
+            if tf.random.uniform(shape=[]) > 0.5:
+                image_slice = tf.image.random_contrast(image_slice, lower=0.8, upper=1.2)
             
-            # Gaussian Noise
-            noise = tf.random.normal(shape=tf.shape(image_slice), mean=0.0, stddev=0.05, dtype=image_slice.dtype)
-            image_slice = image_slice + noise
+            if tf.random.uniform(shape=[]) > 0.3: # Gaussian Noise
+                noise = tf.random.normal(shape=tf.shape(image_slice), mean=0.0, stddev=0.05, dtype=image_slice.dtype)
+                image_slice = image_slice + noise
             
-            # Simple Cutout: zero out a random square patch
-            # Ensure image_slice is 4D for stateless_random_crop or manual patch setting
-            # For simplicity, let's assume H, W, C and apply cutout manually
-            if tf.random.uniform(shape=[]) < 0.3: # Apply cutout with 30% probability
-                img_shape = tf.shape(image_slice)
-                h, w = img_shape[0], img_shape[1]
-                cutout_size_h = tf.cast(tf.cast(h, tf.float32) * 0.25, tf.int32) # 25% of height
-                cutout_size_w = tf.cast(tf.cast(w, tf.float32) * 0.25, tf.int32) # 25% of width
+            # Simple Cutout (more robust implementation)
+            if tf.random.uniform(shape=[]) < 0.3: 
+                img_h, img_w = self.target_size_hw[0], self.target_size_hw[1]
+                cutout_size_h = tf.cast(tf.cast(img_h, tf.float32) * 0.25, tf.int32)
+                cutout_size_w = tf.cast(tf.cast(img_w, tf.float32) * 0.25, tf.int32)
                 
-                # Random top-left corner for the cutout
-                offset_h = tf.random.uniform(shape=[], maxval=h - cutout_size_h + 1, dtype=tf.int32)
-                offset_w = tf.random.uniform(shape=[], maxval=w - cutout_size_w + 1, dtype=tf.int32)
+                offset_h = tf.random.uniform(shape=[], maxval=img_h - cutout_size_h + 1, dtype=tf.int32)
+                offset_w = tf.random.uniform(shape=[], maxval=img_w - cutout_size_w + 1, dtype=tf.int32)
                 
                 # Create a mask for the cutout area
-                indices_h = tf.range(offset_h, offset_h + cutout_size_h)
-                indices_w = tf.range(offset_w, offset_w + cutout_size_w)
+                mask_row = tf.logical_and(tf.range(img_h)[:, tf.newaxis] >= offset_h, tf.range(img_h)[:, tf.newaxis] < offset_h + cutout_size_h)
+                mask_col = tf.logical_and(tf.range(img_w) >= offset_w, tf.range(img_w) < offset_w + cutout_size_w)
+                cutout_mask_2d = tf.logical_and(mask_row, mask_col) # [H, W]
+                cutout_mask = cutout_mask_2d[..., tf.newaxis] # [H, W, 1]
                 
-                # Create a dense tensor of zeros for the patch
-                cutout_patch_zeros = tf.zeros([cutout_size_h, cutout_size_w, tf.shape(image_slice)[-1]], dtype=image_slice.dtype)
-
-                # Use tf.tensor_scatter_nd_update to apply the cutout
-                # This requires constructing indices for scatter_nd_update
-                # A simpler way for a rectangular patch is to construct the full image with the patch
-                # For now, a slightly less efficient but direct way:
-                updates = tf.zeros([cutout_size_h, cutout_size_w, img_shape[2]], dtype=image_slice.dtype)
-                
-                # Create indices for scatter update
-                idx_h = tf.repeat(tf.range(offset_h, offset_h + cutout_size_h), cutout_size_w)
-                idx_w = tf.tile(tf.range(offset_w, offset_w + cutout_size_w), [cutout_size_h])
-                indices = tf.stack([idx_h, idx_w], axis=1) # Shape [N_pixels_in_patch, 2]
-                
-                # For 3D tensor [H, W, C], need to update all channels
-                # This is complex with scatter_nd. A mask multiplication is easier:
-                mask = tf.ones_like(image_slice, dtype=tf.bool)
-                padding_h_before = offset_h
-                padding_h_after = h - (offset_h + cutout_size_h)
-                padding_w_before = offset_w
-                padding_w_after = w - (offset_w + cutout_size_w)
-
-                cutout_area_mask = tf.zeros([cutout_size_h, cutout_size_w, img_shape[2]], dtype=tf.bool)
-                
-                # Pad the cutout_area_mask to match image_slice shape
-                paddings = [
-                    [padding_h_before, padding_h_after],
-                    [padding_w_before, padding_w_after],
-                    [0, 0] # No padding for channels
-                ]
-                full_mask_for_cutout = tf.pad(cutout_area_mask, paddings, "CONSTANT", constant_values=True)
-                image_slice = tf.where(full_mask_for_cutout, image_slice, tf.zeros_like(image_slice))
-
+                image_slice = tf.where(cutout_mask, tf.zeros_like(image_slice), image_slice)
 
         image_slice = tf.clip_by_value(image_slice, 0.0, 1.0)
         return image_slice
-
-    # Helper functions for zoom and shift (modified to handle cases where label is None)
-    def random_zoom(self, image, label, zoom_range=(0.7, 1.3)):
-        # ...existing code...
-        # This function is stateful and complex to integrate directly into tf.data.map
-        # with stateless requirements for paired augmentation.
-        # Consider replacing with tf.image.stateless_random_crop + resize or similar if needed.
-        # For now, _augment_slice_and_label uses flips and rotations.
-        if label is not None:
-            # ...
-            return image, label
-        else:
-            # ...
-            return image, None
 
 
 class DataPipeline:
     def __init__(self, config):
         self.config = config
-        self.dataloader = PancreasDataLoader(config)
+        self.dataloader = PancreasDataLoader(config) # PancreasDataLoader instance
 
-    def setup_training_data(self, labeled_paths, unlabeled_paths, val_paths, batch_size=8):
-        """Sets up all datasets needed for training."""
-        labeled_dataset = self.dataloader.create_dataset(
-            labeled_paths['images'],
-            labeled_paths['labels'],
-            batch_size=batch_size,
-            shuffle=True,
-            augment=True
-        )
-
-        unlabeled_dataset = self.dataloader.create_unlabeled_dataset(
-            unlabeled_paths['images'],
-            batch_size=batch_size
-        )
-
-        val_dataset = self.dataloader.create_dataset(
-            val_paths['images'],
-            val_paths['labels'],
-            batch_size=batch_size,
-            shuffle=False,
-            augment=False
-        )
-
-        return {
-            'labeled': labeled_dataset,
-            'unlabeled': unlabeled_dataset,
-            'validation': val_dataset
-        }
-
-    def update_unlabeled_dataset(self, pseudo_labeled_data):
-        """Updates the unlabeled dataset with new pseudo-labeled data."""
-        if not pseudo_labeled_data:
-            logging.warning("No pseudo-labeled data provided. Keeping the original unlabeled dataset.")
-            return
-
-        all_images = []
-        all_pseudo_labels = []
-        for images, pseudo_labels in pseudo_labeled_data:
-            all_images.append(images)
-            all_pseudo_labels.append(pseudo_labels)
-
-        all_images = tf.concat(all_images, axis=0)
-        all_pseudo_labels = tf.concat(all_pseudo_labels, axis=0)
-
-        self.unlabeled_dataset = tf.data.Dataset.from_tensor_slices((all_images, all_pseudo_labels))
-
-        self.unlabeled_dataset = self.unlabeled_dataset.map(
-            self.preprocess_unlabeled, num_parallel_calls=tf.data.AUTOTUNE
-        )
-        self.unlabeled_dataset = self.unlabeled_dataset.batch(self.config.batch_size)
-        self.unlabeled_dataset = self.unlabeled_dataset.prefetch(tf.data.AUTOTUNE)
-
-    def get_num_batches(self, dataset_type):
-        """Returns the number of batches in the specified dataset."""
-        if dataset_type == 'labeled':
-            dataset = self.labeled_dataset
-        elif dataset_type == 'unlabeled':
-            dataset = self.unlabeled_dataset
-        else:
-            raise ValueError(f"Invalid dataset type: {dataset_type}")
-
-        if dataset is None:
-            return 0
-        else:
-            return len(list(dataset))
-
-    def preprocess_unlabeled(self, image, pseudo_label):
-        """Preprocesses an unlabeled image and its pseudo-label."""
-        image = tf.cast(image, tf.float32)
-        pseudo_label = tf.cast(pseudo_label, tf.int32)
-        return image, pseudo_label
-
-    def _py_load_preprocess_volume(self, image_path, label_path=None):
-        # Wrapper for preprocess_volume to be used in tf.py_function
-        # preprocess_volume now returns image_data, label_data
-        image_data, label_data = self.dataloader.preprocess_volume(image_path, label_path)
+# In class DataPipeline:
+    def _py_load_preprocess_volume_wrapper(self, image_path_input, label_path_input=None):
+        """
+        Wrapper for tf.py_function that calls PancreasDataLoader.preprocess_volume.
+        Handles tensor to Python string conversion and returns numpy arrays.
+        Input 'image_path_input' and 'label_path_input' can be tf.string Tensors or Python bytes.
+        """
         
-        if image_data is None: # Error case from preprocess_volume
-            # Return appropriately shaped empty tensors or handle error
-            # For supervised, need two outputs. For unlabeled, one.
-            # This structure assumes preprocess_volume always returns two, label_data can be None.
-            dummy_img_shape = [0, self.config.img_size_y, self.config.img_size_x, self.config.num_channels]
-            dummy_lbl_shape = [0, self.config.img_size_y, self.config.img_size_x, 1] # Assuming label is single channel
-            
-            if label_path is not None: # Supervised case expects two outputs
-                 return np.zeros(dummy_img_shape, dtype=np.float32), np.zeros(dummy_lbl_shape, dtype=np.int32)
-            else: # Unlabeled case expects one output (image)
-                 return np.zeros(dummy_img_shape, dtype=np.float32)
+        # --- Robust path decoding ---
+        def decode_path(path_input):
+            if isinstance(path_input, tf.Tensor): # If it's a TensorFlow EagerTensor
+                # tf.print(f"DEBUG _py_decode_path: Decoding TF Tensor: {path_input}", output_stream=sys.stderr)
+                return path_input.numpy().decode('utf-8')
+            elif isinstance(path_input, bytes): # If it's already Python bytes
+                # tf.print(f"DEBUG _py_decode_path: Decoding Python bytes: {path_input}", output_stream=sys.stderr)
+                return path_input.decode('utf-8')
+            elif isinstance(path_input, str): # If it's already a Python string (should not happen from generator)
+                # tf.print(f"DEBUG _py_decode_path: Path is already string: {path_input}", output_stream=sys.stderr)
+                return path_input
+            elif path_input is None:
+                return None
+            else:
+                tf.print(f"ERROR _py_decode_path: Unexpected path type {type(path_input)}, value: {path_input}", output_stream=sys.stderr)
+                return None # Or raise an error
+
+        image_path_str = decode_path(image_path_input)
+        if image_path_str is None:
+            tf.print(f"ERROR _py_load_wrapper: Failed to decode image_path_input.", output_stream=sys.stderr)
+            # Fallback for error: return dummy data matching expected Tout signature
+            if label_path_input is not None and decode_path(label_path_input) is not None: # Trying to determine if it was a supervised call
+                return np.zeros([1, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=np.float32), \
+                       np.zeros([1, self.config.img_size_y, self.config.img_size_x, 1], dtype=np.float32)
+            else:
+                return np.zeros([1, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=np.float32)
 
 
-        if label_path is not None:
-            return image_data.astype(np.float32), label_data.astype(np.int32)
-        else:
-            return image_data.astype(np.float32)
-
-
-    def _parse_fn_supervised_train(self, image_path, label_path):
-        # This function will be used with tf.data.Dataset.from_generator
-        # It should yield individual 2D slices: (image_slice, label_slice)
+        label_path_str = None
+        is_supervised_call = False
+        if label_path_input is not None:
+            decoded_label_path = decode_path(label_path_input)
+            if decoded_label_path: # If decoding was successful and not None
+                label_path_str = decoded_label_path
+                is_supervised_call = True
         
-        # Use tf.py_function to call the numpy-based loading logic
-        image_vol, label_vol = tf.py_function(
-            self._py_load_preprocess_volume,
-            [image_path, label_path],
-            [tf.float32, tf.int32] # Output types
-        )
+        # tf.print(f"DEBUG _py_load_wrapper: Decoded image_path='{image_path_str}', label_path='{label_path_str}'", output_stream=sys.stderr)
 
-        # Set shapes if possible, helps TF optimize. Actual shape might vary per volume.
-        # image_vol.set_shape([None, None, None, self.config.num_channels])
-        # label_vol.set_shape([None, None, None, 1]) # Assuming label is single channel
+        # Call the actual preprocessing function
+        result = self.dataloader.preprocess_volume(image_path_str, label_path_str)
 
-        num_slices = tf.shape(image_vol)[0]
-        for i in tf.range(num_slices):
-            img_slice = image_vol[i]
-            lbl_slice = label_vol[i]
-            
-            # Resize slices
-            img_slice_resized = self.dataloader.resize_image_slice(img_slice)
-            lbl_slice_resized = self.dataloader.resize_label_slice(lbl_slice)
-            
-            # Ensure correct shapes for augmentation
-            img_slice_resized.set_shape([self.config.img_size_y, self.config.img_size_x, self.config.num_channels])
-            lbl_slice_resized.set_shape([self.config.img_size_y, self.config.img_size_x, 1])
+        # Handle return based on whether it's supervised or unlabeled
+        if is_supervised_call:
+            img_data, lbl_data = result if result is not None and isinstance(result, tuple) and len(result) == 2 else (None, None)
+            if img_data is None or lbl_data is None: 
+                # tf.print(f"DEBUG _py_load_wrapper: Preprocessing returned None for supervised. Img: {image_path_str}, Lbl: {label_path_str}", output_stream=sys.stderr)
+                return np.zeros([1, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=np.float32), \
+                       np.zeros([1, self.config.img_size_y, self.config.img_size_x, 1], dtype=np.float32)
+            return img_data.astype(np.float32), lbl_data.astype(np.float32)
+        else: # Unlabeled call
+            img_data = result
+            if img_data is None: 
+                # tf.print(f"DEBUG _py_load_wrapper: Preprocessing returned None for unlabeled. Img: {image_path_str}", output_stream=sys.stderr)
+                return np.zeros([1, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=np.float32)
+            return img_data.astype(np.float32)
 
-            yield img_slice_resized, lbl_slice_resized
-            
-    def _parse_fn_unlabeled_train(self, image_path):
-        # This function will be used with tf.data.Dataset.from_generator
-        # It should yield individual 2D image slices
-        image_vol = tf.py_function(
-            self._py_load_preprocess_volume,
-            [image_path, None], # Pass None for label_path
-            tf.float32 # Output type for image
-        )
-        # image_vol.set_shape([None, None, None, self.config.num_channels])
+    def _parse_volume_to_slices_supervised(self, image_path_tensor, label_path_tensor):
+        # Generator function to yield individual 2D slices
+        # Wrapped by tf.py_function, so inputs are Tensors
+        img_vol_np, lbl_vol_np = self._py_load_preprocess_volume_wrapper(image_path_tensor, label_path_tensor)
+        
+        # If loading failed, img_vol_np will be a dummy array of depth 1. Loop will run once.
+        for i in range(img_vol_np.shape[0]):
+            yield img_vol_np[i], lbl_vol_np[i] # Yields [H,W,C_img], [H,W,1]
 
-        num_slices = tf.shape(image_vol)[0]
-        for i in tf.range(num_slices):
-            img_slice = image_vol[i]
-            img_slice_resized = self.dataloader.resize_image_slice(img_slice)
-            img_slice_resized.set_shape([self.config.img_size_y, self.config.img_size_x, self.config.num_channels])
-            yield img_slice_resized
+    def _parse_volume_to_slices_unlabeled(self, image_path_tensor):
+        # Generator function to yield individual 2D image slices
+        img_vol_np = self._py_load_preprocess_volume_wrapper(image_path_tensor, None)
+        
+        # If loading failed, img_vol_np will be a dummy array of depth 1. Loop will run once.
+        for i in range(img_vol_np.shape[0]):
+            yield img_vol_np[i] # Yields [H,W,C_img]
 
-    def _parse_fn_supervised_eval(self, image_path, label_path):
-        # Similar to _parse_fn_supervised_train but without augmentation in mapping
-        # Yields (image_slice_resized, label_slice_resized)
-        image_vol, label_vol = tf.py_function(
-            self._py_load_preprocess_volume,
-            [image_path, label_path],
-            [tf.float32, tf.int32]
-        )
-        num_slices = tf.shape(image_vol)[0]
-        for i in tf.range(num_slices):
-            img_slice = image_vol[i]
-            lbl_slice = label_vol[i]
-            img_slice_resized = self.dataloader.resize_image_slice(img_slice)
-            lbl_slice_resized = self.dataloader.resize_label_slice(lbl_slice)
-            img_slice_resized.set_shape([self.config.img_size_y, self.config.img_size_x, self.config.num_channels])
-            lbl_slice_resized.set_shape([self.config.img_size_y, self.config.img_size_x, 1])
-            yield img_slice_resized, lbl_slice_resized
-            
     def build_labeled_dataset(self, image_paths, label_paths, batch_size, is_training=True):
         if not image_paths or not label_paths:
-            return None # Or an empty dataset
+            tf.print("WARNING: build_labeled_dataset received empty image_paths or label_paths.", output_stream=sys.stderr)
+            return tf.data.Dataset.from_tensor_slices(([], [])).batch(batch_size) # Return empty batched dataset
 
         dataset = tf.data.Dataset.from_tensor_slices((image_paths, label_paths))
         
-        # Shuffle file paths before loading and slicing
         if is_training:
             dataset = dataset.shuffle(buffer_size=len(image_paths))
 
-        # Use interleave to process files one by one and flatten their slices into the dataset
         dataset = dataset.interleave(
-            lambda img_path, lbl_path: tf.data.Dataset.from_generator(
-                self._parse_fn_supervised_train,
-                args=(img_path, lbl_path),
+            lambda img_path_tensor, lbl_path_tensor: tf.data.Dataset.from_generator(
+                self._parse_volume_to_slices_supervised,
+                args=(img_path_tensor, lbl_path_tensor),
                 output_signature=(
                     tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32),
-                    tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, 1), dtype=tf.float32) # Labels are float32 after resize
+                    tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, 1), dtype=tf.float32)
                 )
             ),
-            cycle_length=tf.data.AUTOTUNE, # Number of parallel file processing
-            num_parallel_calls=tf.data.AUTOTUNE,
+            cycle_length=4, # Process 4 files concurrently
+            num_parallel_calls=AUTOTUNE,
             deterministic=not is_training
         )
         
-        # Filter out potential None slices from loading errors if preprocess_volume was modified to return them
-        # dataset = dataset.filter(lambda img, lbl: tf.reduce_all(tf.shape(img) > 0))
-
-
+        # Filter out dummy slices (which have depth 1 and all zeros from the error handling)
+        # A real slice might be all zeros, but a dummy error slice also has specific small depth.
+        # This filter assumes successfully processed volumes have depth > 1.
+        # If preprocess_volume now returns actual data (even if 1 slice), this filter might not be needed
+        # or might need adjustment. Let's remove it for now and rely on preprocess_volume handling.
+        # dataset = dataset.filter(lambda img, lbl: tf.shape(img)[0] > 0) # tf.shape(img)[0] is H for a slice here
+        
         if is_training:
             # Augment after slices are generated
-            # Need a seed for stateless augmentations
-            # Create a seed dataset to zip with the main dataset
-            seed_counter = tf.data.experimental.Counter()
-            seed_dataset = tf.data.Dataset.zip((seed_counter, seed_counter)).map(lambda s1, s2: (s1,s2)) #dummy, just to get seeds
+            seed_dataset = tf.data.Dataset.counter().map(lambda x: (x, x + 100000)) # Generate pairs of seeds
 
             dataset = tf.data.Dataset.zip((dataset, seed_dataset))
             dataset = dataset.map(
-                lambda x, seed_pair_tf: self.dataloader._augment_slice_and_label(x[0], x[1], seed=(tf.cast(seed_pair_tf[0], tf.int32), tf.cast(seed_pair_tf[1], tf.int32))),
+                lambda data_pair, seed_pair: self.dataloader._augment_slice_and_label(data_pair[0], data_pair[1], seed_pair),
                 num_parallel_calls=AUTOTUNE
             )
-            dataset = dataset.shuffle(buffer_size=1000) # Shuffle slices
+            dataset = dataset.shuffle(buffer_size=1000)
 
         dataset = dataset.batch(batch_size)
         dataset = dataset.prefetch(buffer_size=AUTOTUNE)
         return dataset
 
     def _augment_for_mean_teacher(self, image_slice):
-        # image_slice is an unaugmented, resized slice
+        # image_slice is an unaugmented, resized slice [H,W,C]
         student_input = self.dataloader._augment_single_image_slice(image_slice, strength='strong')
         teacher_input = self.dataloader._augment_single_image_slice(image_slice, strength='weak')
-        # Ensure shapes are set
-        student_input.set_shape([self.config.img_size_y, self.config.img_size_x, self.config.num_channels])
-        teacher_input.set_shape([self.config.img_size_y, self.config.img_size_x, self.config.num_channels])
         return student_input, teacher_input
 
     def build_unlabeled_dataset_for_mean_teacher(self, image_paths, batch_size, is_training=True):
         if not image_paths:
-            return None
-
-        dataset = tf.data.Dataset.from_tensor_slices(image_paths)
-
-        if is_training:
-            dataset = dataset.shuffle(buffer_size=len(image_paths)) # Shuffle file paths
-
-        dataset = dataset.interleave(
-            lambda img_path: tf.data.Dataset.from_generator(
-                self._parse_fn_unlabeled_train,
-                args=(img_path,),
-                output_signature=tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32)
-            ),
-            cycle_length=tf.data.AUTOTUNE,
-            num_parallel_calls=tf.data.AUTOTUNE,
-            deterministic=not is_training
-        )
-        
-        # dataset = dataset.filter(lambda img: tf.reduce_all(tf.shape(img) > 0))
-
-
-        if is_training:
-            dataset = dataset.map(self._augment_for_mean_teacher, num_parallel_calls=AUTOTUNE)
-            dataset = dataset.shuffle(buffer_size=1000) # Shuffle augmented slices
-
-        dataset = dataset.batch(batch_size)
-        dataset = dataset.prefetch(buffer_size=AUTOTUNE)
-        return dataset
-
-    def build_validation_dataset(self, image_paths, label_paths, batch_size):
-        # Similar to build_labeled_dataset but uses _parse_fn_supervised_eval (no augmentation)
-        if not image_paths or not label_paths:
-            return None
-
-        dataset = tf.data.Dataset.from_tensor_slices((image_paths, label_paths))
-        
-        # No shuffling of file paths for validation
-        dataset = dataset.interleave(
-            lambda img_path, lbl_path: tf.data.Dataset.from_generator(
-                self._parse_fn_supervised_eval, # Use eval parser
-                args=(img_path, lbl_path),
-                output_signature=(
-                    tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32),
-                    tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, 1), dtype=tf.float32)
-                )
-            ),
-            cycle_length=tf.data.AUTOTUNE,
-            num_parallel_calls=tf.data.AUTOTUNE,
-            deterministic=True # Deterministic for validation
-        )
-        # dataset = dataset.filter(lambda img, lbl: tf.reduce_all(tf.shape(img) > 0))
-
-        dataset = dataset.batch(batch_size)
-        dataset = dataset.prefetch(buffer_size=AUTOTUNE)
-        return dataset
-
-    def build_unlabeled_dataset(self, image_paths, batch_size, is_training=True, augment_fn=None):
-        # Generic unlabeled dataset builder, can be used by other SSL methods if needed
-        # For Mean Teacher, build_unlabeled_dataset_for_mean_teacher is more specific
-        if not image_paths:
-            return None
+            tf.print("WARNING: build_unlabeled_dataset_for_mean_teacher received empty image_paths.", output_stream=sys.stderr)
+            return tf.data.Dataset.from_tensor_slices(([], [])).batch(batch_size) # Needs to yield pairs
 
         dataset = tf.data.Dataset.from_tensor_slices(image_paths)
 
@@ -1110,27 +404,47 @@ class DataPipeline:
             dataset = dataset.shuffle(buffer_size=len(image_paths))
 
         dataset = dataset.interleave(
-            lambda img_path: tf.data.Dataset.from_generator(
-                self._parse_fn_unlabeled_train,
-                args=(img_path,),
+            lambda img_path_tensor: tf.data.Dataset.from_generator(
+                self._parse_volume_to_slices_unlabeled,
+                args=(img_path_tensor,),
                 output_signature=tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32)
             ),
-            cycle_length=tf.data.AUTOTUNE,
-            num_parallel_calls=tf.data.AUTOTUNE,
+            cycle_length=4,
+            num_parallel_calls=AUTOTUNE,
             deterministic=not is_training
         )
         
-        # dataset = dataset.filter(lambda img: tf.reduce_all(tf.shape(img) > 0))
-
-
-        if is_training and augment_fn: # If a generic augmentation function is provided
-            dataset = dataset.map(augment_fn, num_parallel_calls=AUTOTUNE)
-        elif is_training: # Default single augmentation if no specific one for MT
-             dataset = dataset.map(lambda x: self.dataloader._augment_single_image_slice(x, strength='weak'), num_parallel_calls=AUTOTUNE)
-
+        # dataset = dataset.filter(lambda img: tf.shape(img)[0] > 0) # Filter based on height of slice
 
         if is_training:
+            dataset = dataset.map(self._augment_for_mean_teacher, num_parallel_calls=AUTOTUNE)
             dataset = dataset.shuffle(buffer_size=1000)
+
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(buffer_size=AUTOTUNE)
+        return dataset
+
+    def build_validation_dataset(self, image_paths, label_paths, batch_size):
+        if not image_paths or not label_paths:
+            tf.print("WARNING: build_validation_dataset received empty image_paths or label_paths.", output_stream=sys.stderr)
+            return tf.data.Dataset.from_tensor_slices(([], [])).batch(batch_size)
+
+        dataset = tf.data.Dataset.from_tensor_slices((image_paths, label_paths))
+        
+        dataset = dataset.interleave(
+            lambda img_path_tensor, lbl_path_tensor: tf.data.Dataset.from_generator(
+                self._parse_volume_to_slices_supervised, # Uses supervised parser (no augmentation by default)
+                args=(img_path_tensor, lbl_path_tensor),
+                output_signature=(
+                    tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32),
+                    tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, 1), dtype=tf.float32)
+                )
+            ),
+            cycle_length=4,
+            num_parallel_calls=AUTOTUNE,
+            deterministic=True
+        )
+        # dataset = dataset.filter(lambda img, lbl: tf.shape(img)[0] > 0)
 
         dataset = dataset.batch(batch_size)
         dataset = dataset.prefetch(buffer_size=AUTOTUNE)

@@ -6,18 +6,13 @@ import random
 import time
 import numpy as np
 import tensorflow as tf
+import matplotlib.pyplot as plt
+import pandas as pd
 
-# Ensure the script can find other modules in the same directory or specified paths
-# Assuming 'config.py', 'data_loader_tf2.py', 'models_tf2.py', 'train_ssl_tf2n.py' are accessible
-# If they are in a specific project directory, that directory should be in PYTHONPATH
-# or added to sys.path here. For this example, let's assume they are in the same dir or
-# a directory structure that Python's import system can resolve.
-# Example: sys.path.append(str(Path(__file__).resolve().parent))
-
-from config import ExperimentConfig, StableSSLConfig # Assuming StableSSLConfig can be a base
+from config import ExperimentConfig, StableSSLConfig
 from data_loader_tf2 import DataPipeline
-from models_tf2 import PancreasSeg # Assuming PancreasSeg is your U-Net model
-from train_ssl_tf2n import MeanTeacherTrainer # The new MeanTeacherTrainer
+from models_tf2 import PancreasSeg
+from train_ssl_tf2n import MeanTeacherTrainer
 
 # --- Define Custom Loss and Metric ---
 class DiceBCELoss(tf.keras.losses.Loss):
@@ -26,21 +21,21 @@ class DiceBCELoss(tf.keras.losses.Loss):
         self.weight_bce = weight_bce
         self.weight_dice = weight_dice
         self.smooth = smooth
-        self.bce = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+        self.bce_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
     def call(self, y_true, y_pred_logits):
         y_true_f = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
-        y_pred_f = tf.cast(tf.reshape(y_pred_logits, [-1]), tf.float32)
+        y_pred_logits_f = tf.cast(tf.reshape(y_pred_logits, [-1]), tf.float32)
 
-        # Dice Loss
-        intersection = tf.reduce_sum(y_true_f * y_pred_f)
-        dice_loss = 1 - (2. * intersection + self.smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + self.smooth)
+        y_pred_probs_f_for_dice = tf.nn.sigmoid(y_pred_logits_f)
+        intersection = tf.reduce_sum(y_true_f * y_pred_probs_f_for_dice)
+        dice_numerator = 2. * intersection + self.smooth
+        dice_denominator = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_probs_f_for_dice) + self.smooth
+        dice_loss = 1 - (dice_numerator / dice_denominator)
 
-        # BCE Loss
-        bce_loss = tf.keras.losses.binary_crossentropy(y_true_f, y_pred_f)
-        bce_loss = tf.reduce_mean(bce_loss)
-
-        return self.weight_dice * dice_loss + self.weight_bce * bce_loss
+        bce_loss_val = self.bce_fn(y_true_f, y_pred_logits_f)
+        
+        return self.weight_dice * dice_loss + self.weight_bce * bce_loss_val
 
     def get_config(self):
         config = super().get_config()
@@ -51,7 +46,6 @@ class DiceBCELoss(tf.keras.losses.Loss):
         })
         return config
 
-# --- Define Custom Callback for Consistency Weight ---
 class ConsistencyWeightScheduler(tf.keras.callbacks.Callback):
     def __init__(self, consistency_weight_var, max_weight, rampup_epochs):
         super().__init__()
@@ -60,21 +54,18 @@ class ConsistencyWeightScheduler(tf.keras.callbacks.Callback):
         self.rampup_epochs = rampup_epochs
 
     def on_epoch_begin(self, epoch, logs=None):
-        if self.rampup_epochs == 0: # Handle case for immediate max weight
+        if self.rampup_epochs == 0:
              new_weight = self.max_weight
         elif epoch < self.rampup_epochs:
             new_weight = self.max_weight * (float(epoch + 1) / float(self.rampup_epochs))
         else:
             new_weight = self.max_weight
         self.consistency_weight_var.assign(new_weight)
-        if epoch % 10 == 0 or epoch == 0 : # Print less frequently
-             print(f"Epoch {epoch+1}: Consistency weight set to {new_weight:.4f}")
+        if epoch % 10 == 0 or epoch == 0 :
+             tf.print(f"Epoch {epoch+1} (MT Phase): Consistency weight set to {new_weight:.4f}")
 
-# --- Data Preparation Function ---
 def prepare_data_paths(data_dir_str: str, num_labeled_patients: int, num_validation_patients: int, seed: int = 42):
     data_dir = Path(data_dir_str)
-    # Assuming patient data is in subdirectories like 'pancreas_001', 'pancreas_002', etc.
-    # And each contains 'image.npy' and 'mask.npy'
     all_patient_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir() and p.name.startswith("pancreas_")])
     
     if not all_patient_dirs:
@@ -93,39 +84,34 @@ def prepare_data_paths(data_dir_str: str, num_labeled_patients: int, num_validat
     remaining_patient_dirs = all_patient_dirs[num_validation_patients:]
     
     labeled_patient_dirs = remaining_patient_dirs[:num_labeled_patients]
-    unlabeled_patient_dirs = remaining_patient_dirs[num_labeled_patients:] # All others are unlabeled
+    unlabeled_patient_dirs = remaining_patient_dirs[num_labeled_patients:] 
 
-    print(f"Total patient dirs: {len(all_patient_dirs)}")
-    print(f"Labeled patient dirs: {len(labeled_patient_dirs)}")
-    print(f"Unlabeled patient dirs: {len(unlabeled_patient_dirs)}")
-    print(f"Validation patient dirs: {len(validation_patient_dirs)}")
+    tf.print(f"Data Split: Total patient dirs: {len(all_patient_dirs)}, "
+             f"Labeled: {len(labeled_patient_dirs)}, "
+             f"Unlabeled: {len(unlabeled_patient_dirs)}, "
+             f"Validation: {len(validation_patient_dirs)}")
 
     def get_file_paths_from_patient_dirs(patient_dirs_list, is_labeled=True):
         image_paths = []
         label_paths = [] if is_labeled else None
-        
         for p_dir in patient_dirs_list:
-            img_file = p_dir / "image.npy"
-            mask_file = p_dir / "mask.npy"
-            
+            img_file = p_dir / "image.npy"; mask_file = p_dir / "mask.npy"
             if img_file.exists() and (not is_labeled or mask_file.exists()):
                 image_paths.append(str(img_file))
-                if is_labeled:
-                    label_paths.append(str(mask_file))
+                if is_labeled: label_paths.append(str(mask_file))
             else:
-                print(f"Warning: Missing image.npy or mask.npy (if labeled) in {p_dir}", file=sys.stderr)
-        
-        if is_labeled:
-            return image_paths, label_paths
-        return image_paths
+                if not img_file.exists(): tf.print(f"Warning: Missing image.npy in {p_dir}", output_stream=sys.stderr)
+                if is_labeled and not mask_file.exists(): tf.print(f"Warning: Missing mask.npy in {p_dir}", output_stream=sys.stderr)
+        return (image_paths, label_paths) if is_labeled else image_paths
 
     labeled_images, labeled_labels = get_file_paths_from_patient_dirs(labeled_patient_dirs, is_labeled=True)
     unlabeled_images = get_file_paths_from_patient_dirs(unlabeled_patient_dirs, is_labeled=False)
     validation_images, validation_labels = get_file_paths_from_patient_dirs(validation_patient_dirs, is_labeled=True)
     
-    if not labeled_images: print("Warning: No labeled image paths were found.", file=sys.stderr)
-    if not unlabeled_images: print("Warning: No unlabeled image paths were found.", file=sys.stderr)
-    if not validation_images: print("Warning: No validation image paths were found.", file=sys.stderr)
+    if not labeled_images: tf.print("CRITICAL WARNING: No Labeled image paths found after filtering.", output_stream=sys.stderr)
+    if not unlabeled_images and len(unlabeled_patient_dirs) > 0 : tf.print("WARNING: Unlabeled patient dirs were selected, but no valid image.npy files found in them.", output_stream=sys.stderr)
+    elif not unlabeled_images: tf.print("INFO: No Unlabeled image paths found (this might be expected).", output_stream=sys.stderr)
+    if not validation_images: tf.print("CRITICAL WARNING: No Validation image paths found after filtering.", output_stream=sys.stderr)
 
     return {
         'labeled': {'images': labeled_images, 'labels': labeled_labels},
@@ -133,267 +119,262 @@ def prepare_data_paths(data_dir_str: str, num_labeled_patients: int, num_validat
         'validation': {'images': validation_images, 'labels': validation_labels}
     }
 
-# --- Main Training Function ---
+class DiceCoefficient(tf.keras.metrics.Metric):
+    def __init__(self, name='dice_coefficient', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.sum_dice_scores = self.add_weight(name='sum_dice_scores', initializer='zeros')
+        self.num_samples_processed = self.add_weight(name='num_samples_processed', initializer='zeros')
+        self.smooth = 1e-6
+
+    def update_state(self, y_true, y_pred_logits, sample_weight=None):
+        y_true_f = tf.cast(y_true, tf.float32)
+        y_pred_probs = tf.nn.sigmoid(y_pred_logits) 
+        y_pred_f_binary = tf.cast(y_pred_probs > 0.5, tf.float32)
+        
+        intersection = tf.reduce_sum(y_true_f * y_pred_f_binary, axis=[1,2,3]) 
+        sum_true = tf.reduce_sum(y_true_f, axis=[1,2,3])
+        sum_pred = tf.reduce_sum(y_pred_f_binary, axis=[1,2,3])
+        dice_per_sample = (2. * intersection + self.smooth) / (sum_true + sum_pred + self.smooth)
+        
+        current_batch_dice_sum = tf.reduce_sum(dice_per_sample)
+        current_batch_size = tf.cast(tf.shape(y_true)[0], tf.float32)
+
+        self.sum_dice_scores.assign_add(current_batch_dice_sum)
+        self.num_samples_processed.assign_add(current_batch_size)
+        
+    def result(self):
+        return tf.cond(tf.equal(self.num_samples_processed, 0.0),
+                       lambda: tf.constant(0.0, dtype=tf.float32),
+                       lambda: self.sum_dice_scores / self.num_samples_processed)
+            
+    def reset_state(self):
+        self.sum_dice_scores.assign(0.)
+        self.num_samples_processed.assign(0.)
+
+    def get_config(self):
+        config = super().get_config(); config.update({'smooth': self.smooth}); return config
+
+def plot_training_summary(history_object, csv_log_path: Path, plot_save_dir: Path, plot_title_prefix: str):
+    plot_save_dir.mkdir(parents=True, exist_ok=True)
+    data_source = None; history_data = {}
+
+    if history_object and hasattr(history_object, 'history') and history_object.history:
+        history_data = history_object.history
+        data_source = "Keras History Object"
+    elif csv_log_path.exists():
+        try:
+            df = pd.read_csv(csv_log_path)
+            if not df.empty:
+                history_data = {col: df[col].tolist() for col in df.columns}
+                if 'epoch' in df.columns: history_data['epochs_list'] = df['epoch'].tolist()
+                else: history_data['epochs_list'] = list(range(1, len(df) + 1))
+                data_source = "CSV Log File"
+        except Exception as e: tf.print(f"Error reading CSV log for plotting: {e}", output_stream=sys.stderr)
+    
+    if not history_data: tf.print("No data found for plotting.", output_stream=sys.stderr); return
+    tf.print(f"Generating plots from: {data_source}", output_stream=sys.stderr)
+
+    epochs = history_data.get('epochs_list', None)
+    if epochs is None:
+        for key in ['loss', 'student_dice', 'val_loss', 'val_student_dice', 'pretrain_student_dice', 'val_pretrain_student_dice']:
+            if key in history_data and history_data[key]:
+                epochs = list(range(1, len(history_data[key]) + 1)); break
+    if epochs is None: tf.print("Could not determine epochs for plotting.", output_stream=sys.stderr); return
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+    ax1, ax2 = axes[0], axes[1]
+
+    # Losses
+    if 'loss' in history_data: ax1.plot(epochs, history_data['loss'], label='Total Train Loss', c='blue')
+    if 'supervised_loss' in history_data: ax1.plot(epochs, history_data['supervised_loss'], label='Sup. Loss (Train)', c='orange', ls='--')
+    if 'consistency_loss' in history_data: ax1.plot(epochs, history_data['consistency_loss'], label='Cons. Loss (Train)', c='green', ls=':')
+    if 'val_loss' in history_data: ax1.plot(epochs, history_data['val_loss'], label='Total Val Loss', c='red')
+    ax1.set_title('Losses'); ax1.set_ylabel('Loss'); ax1.legend(); ax1.grid(True)
+
+    # Dice Scores
+    if 'student_dice' in history_data: ax2.plot(epochs, history_data['student_dice'], label='Student Dice (Train)', c='dodgerblue')
+    elif 'pretrain_student_dice' in history_data: ax2.plot(epochs, history_data['pretrain_student_dice'], label='Student Dice (PreTrain)', c='dodgerblue') # For pretrain plot
+    
+    if 'val_student_dice' in history_data: ax2.plot(epochs, history_data['val_student_dice'], label='Student Dice (Val)', c='deepskyblue')
+    elif 'val_pretrain_student_dice' in history_data: ax2.plot(epochs, history_data['val_pretrain_student_dice'], label='Student Dice (Val PreTrain)', c='deepskyblue')
+
+    if 'val_teacher_dice' in history_data: ax2.plot(epochs, history_data['val_teacher_dice'], label='Teacher Dice (Val)', c='lightcoral', ls='--')
+    
+    ax2.set_title('Dice Scores'); ax2.set_xlabel('Epoch'); ax2.set_ylabel('Dice Score'); ax2.set_ylim(0, 1.05); ax2.legend(); ax2.grid(True)
+
+    plt.suptitle(plot_title_prefix, fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plot_filename = plot_save_dir / f"{plot_title_prefix.replace(' ','_').lower()}_curves.png"
+    try: plt.savefig(plot_filename); tf.print(f"Saved plot: {plot_filename}")
+    except Exception as e: tf.print(f"Error saving plot: {e}", output_stream=sys.stderr)
+    plt.close()
+
 def main(args):
-    # 1. Setup Configuration
     exp_config = ExperimentConfig(
         experiment_name=args.experiment_name,
         experiment_type='semi-supervised-mean-teacher',
         results_dir=Path(args.output_dir) / args.experiment_name
     )
-    # Ensure results directory exists
     exp_config.results_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir = exp_config.results_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
 
-    # Model/Data Config (using StableSSLConfig as a base)
-    # TODO: Consider creating a MeanTeacherConfig if more specific params are needed
+
     model_data_config = StableSSLConfig(
-        img_size_x=args.img_size,
-        img_size_y=args.img_size,
-        num_channels=1, # Assuming grayscale medical images
-        num_classes=1,  # For binary segmentation (pancreas vs background)
-        batch_size=args.batch_size 
+        img_size_x=args.img_size, img_size_y=args.img_size,
+        num_channels=1, num_classes=1, batch_size=args.batch_size 
     )
-    # Add Mean Teacher specific params if not in StableSSLConfig
-    # For example:
-    # model_data_config.ema_decay = args.ema_decay 
-    # model_data_config.consistency_weight_max = args.consistency_max
-    # model_data_config.consistency_rampup_epochs = args.consistency_rampup
 
-    # 2. GPU Setup (Optional, TensorFlow usually handles this)
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"Using {len(gpus)} GPU(s) with memory growth enabled.")
-        except RuntimeError as e:
-            print(f"Error setting up GPU: {e}", file=sys.stderr)
-    else:
-        print("No GPU detected by TensorFlow. Running on CPU.", file=sys.stderr)
+        try: [tf.config.experimental.set_memory_growth(gpu, True) for gpu in gpus]; tf.print(f"Using {len(gpus)} GPU(s).")
+        except RuntimeError as e: tf.print(f"GPU Error: {e}", sys.stderr)
+    else: tf.print("No GPU. Using CPU.", sys.stderr)
 
+    tf.print("Preparing data paths...")
+    data_paths = prepare_data_paths(args.data_dir, args.num_labeled, args.num_validation, args.seed)
 
-    # 3. Prepare Data Paths
-    print("Preparing data paths...")
-    data_paths = prepare_data_paths(
-        args.data_dir,
-        num_labeled_patients=args.num_labeled,
-        num_validation_patients=args.num_validation,
-        seed=args.seed
-    )
-
-    # 4. Initialize DataPipeline
-    print("Initializing DataPipeline...")
+    tf.print("Initializing DataPipeline...")
     data_pipeline = DataPipeline(config=model_data_config)
 
-    # 5. Create Datasets
-    print("Building datasets...")
-    labeled_train_dataset = data_pipeline.build_labeled_dataset(
-        image_paths=data_paths['labeled']['images'],
-        label_paths=data_paths['labeled']['labels'],
-        batch_size=args.batch_size,
-        is_training=True
-    )
-    unlabeled_train_dataset = data_pipeline.build_unlabeled_dataset_for_mean_teacher(
-        image_paths=data_paths['unlabeled']['images'],
-        batch_size=args.batch_size,
-        is_training=True
-    )
-    validation_dataset = data_pipeline.build_validation_dataset(
-        image_paths=data_paths['validation']['images'],
-        label_paths=data_paths['validation']['labels'],
-        batch_size=args.batch_size
-    )
+    # --- STUDENT PRE-TRAINING PHASE ---
+    if args.student_pretrain_epochs > 0:
+        tf.print(f"--- Starting Student Pre-training Phase ({args.student_pretrain_epochs} epochs) ---")
+        pretrain_student_model = PancreasSeg(model_data_config)
+        dummy_input = tf.zeros((1, args.img_size, args.img_size, model_data_config.num_channels))
+        _ = pretrain_student_model(dummy_input, training=False)
 
-    if labeled_train_dataset is None or unlabeled_train_dataset is None or validation_dataset is None:
-        print("Error: One or more datasets could not be built. Exiting.", file=sys.stderr)
-        sys.exit(1)
+        pretrain_optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
+        pretrain_loss = DiceBCELoss()
+        pretrain_metrics = [DiceCoefficient(name='pretrain_student_dice')]
+        
+        pretrain_student_model.compile(optimizer=pretrain_optimizer, loss=pretrain_loss, metrics=pretrain_metrics)
+
+        if not data_paths['labeled']['images']: sys.exit("CRITICAL ERROR: No labeled data for pre-training.")
+        pretrain_labeled_dataset = data_pipeline.build_labeled_dataset(
+            data_paths['labeled']['images'], data_paths['labeled']['labels'],
+            args.batch_size, is_training=True).prefetch(tf.data.AUTOTUNE)
+
+        if not data_paths['validation']['images']: sys.exit("CRITICAL ERROR: No validation data for pre-training.")
+        pretrain_validation_dataset = data_pipeline.build_validation_dataset(
+             data_paths['validation']['images'], data_paths['validation']['labels'], args.batch_size
+        ).prefetch(tf.data.AUTOTUNE)
+
+
+        if tf.data.experimental.cardinality(pretrain_labeled_dataset) == 0:
+            sys.exit("CRITICAL ERROR: Labeled dataset for pre-training is empty after build.")
+
+        pretrain_csv_log_path = exp_config.results_dir / "pretrain_log.csv"
+        pretrain_history = pretrain_student_model.fit(
+            pretrain_labeled_dataset,
+            epochs=args.student_pretrain_epochs,
+            validation_data=pretrain_validation_dataset,
+            verbose=args.verbose,
+            callbacks=[tf.keras.callbacks.CSVLogger(str(pretrain_csv_log_path))]
+        )
+        tf.print("--- Student Pre-training Phase Completed ---")
+        plot_title = f"Student Pre-Training ({args.num_labeled} Labeled)"
+        plot_training_summary(pretrain_history, pretrain_csv_log_path, plots_dir, plot_title)
+    else:
+        pretrain_student_model = None # No pre-training
+        tf.print("--- Skipping Student Pre-training Phase ---")
+
+
+    # --- MEAN TEACHER TRAINING PHASE ---
+    tf.print("Instantiating student and teacher models for Mean Teacher phase...")
+    student_model = PancreasSeg(model_data_config)
+    teacher_model = PancreasSeg(model_data_config)
+    dummy_input = tf.zeros((1, args.img_size, args.img_size, model_data_config.num_channels))
+    _ = student_model(dummy_input, training=False); _ = teacher_model(dummy_input, training=False)
+
+    if pretrain_student_model is not None:
+        student_model.set_weights(pretrain_student_model.get_weights())
+        tf.print("Main student model weights initialized from pre-trained student.")
+        del pretrain_student_model # Free memory
+    else:
+        tf.print("Main student model initialized with random weights.")
     
-    # Combine labeled and unlabeled datasets for training
-    # Ensure they have a compatible structure for zipping and that unlabeled_train_dataset
-    # yields pairs for student/teacher views as expected by MeanTeacherTrainer
-    train_dataset = tf.data.Dataset.zip((labeled_train_dataset, unlabeled_train_dataset))
+    teacher_model.set_weights(student_model.get_weights())
+    tf.print("Teacher model weights initialized from student model.")
+
+    mean_teacher_trainer = MeanTeacherTrainer(student_model, teacher_model, args.ema_decay)
+    optimizer_mt = tf.keras.optimizers.Adam(learning_rate=args.learning_rate) # Fresh optimizer for MT phase
+    supervised_loss_mt = DiceBCELoss()
+    student_dice_metric_mt = DiceCoefficient(name='student_dice')
+    mean_teacher_trainer.compile(optimizer_mt, supervised_loss_mt, metrics=[student_dice_metric_mt])
+    tf.print("MeanTeacherTrainer compiled for MT phase.")
+
+    # Datasets for MT phase
+    if not data_paths['labeled']['images']: sys.exit("CRITICAL: No labeled data for MT phase.")
+    labeled_train_dataset_mt = data_pipeline.build_labeled_dataset(
+        data_paths['labeled']['images'], data_paths['labeled']['labels'], args.batch_size, True).prefetch(tf.data.AUTOTUNE)
+
+    if data_paths['unlabeled']['images']:
+        unlabeled_train_dataset_mt = data_pipeline.build_unlabeled_dataset_for_mean_teacher(
+            data_paths['unlabeled']['images'], args.batch_size, True).repeat().prefetch(tf.data.AUTOTUNE)
+    else:
+        tf.print("INFO: No actual unlabeled data. Using subset of labeled for dummy unlabeled dataset.", output_stream=sys.stderr)
+        num_dummy = min(args.batch_size * 2, len(data_paths['labeled']['images']))
+        if num_dummy == 0: sys.exit("CRITICAL: Cannot create dummy unlabeled from empty labeled set.")
+        unlabeled_train_dataset_mt = data_pipeline.build_unlabeled_dataset_for_mean_teacher(
+            data_paths['labeled']['images'][:num_dummy], args.batch_size, True).repeat().prefetch(tf.data.AUTOTUNE)
+
+    if not data_paths['validation']['images']: sys.exit("CRITICAL: No validation data for MT phase.")
+    validation_dataset_mt = data_pipeline.build_validation_dataset(
+         data_paths['validation']['images'], data_paths['validation']['labels'], args.batch_size
+    ).prefetch(tf.data.AUTOTUNE)
+
+    if any(ds is None or tf.data.experimental.cardinality(ds) == 0 for ds in [labeled_train_dataset_mt, unlabeled_train_dataset_mt, validation_dataset_mt if validation_dataset_mt is not None else labeled_train_dataset_mt]): # check val if exists
+        sys.exit("CRITICAL ERROR: One or more datasets for MT phase is None or empty after build.")
+
+    train_dataset_mt = tf.data.Dataset.zip((labeled_train_dataset_mt, unlabeled_train_dataset_mt))
+
+    callbacks_mt = [
+        ConsistencyWeightScheduler(mean_teacher_trainer.consistency_weight, args.consistency_max, args.consistency_rampup),
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(exp_config.results_dir / "checkpoints" / "best_mt_student_epoch_{epoch:02d}_val_dice_{val_student_dice:.4f}.h5"),
+            save_weights_only=True, monitor='val_student_dice', mode='max', save_best_only=True, verbose=1),
+        tf.keras.callbacks.TensorBoard(log_dir=str(exp_config.results_dir / "logs_mt"), histogram_freq=1),
+        tf.keras.callbacks.CSVLogger(str(exp_config.results_dir / "mean_teacher_training_log.csv")),
+        tf.keras.callbacks.EarlyStopping(monitor='val_student_dice', patience=args.early_stopping_patience, mode='max', verbose=1, restore_best_weights=True)
+    ]
     
-    # Prefetch for performance
-    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
-    validation_dataset = validation_dataset.prefetch(tf.data.AUTOTUNE)
-
-    # 6. Instantiate Student and Teacher Models
-    print("Instantiating student and teacher models...")
-    student_model = PancreasSeg(model_data_config) # Pass model_data_config positionally
-    teacher_model = PancreasSeg(model_data_config) # Pass model_data_config positionally
-
-    # Build models by calling them with dummy data (important for weight initialization before trainer compile)
-    dummy_input_shape = (1, args.img_size, args.img_size, model_data_config.num_channels)
-    dummy_input = tf.zeros(dummy_input_shape)
-    _ = student_model(dummy_input)
-    _ = teacher_model(dummy_input)
-    print(f"Student model built: {student_model.built}, Name: {student_model.name}")
-    print(f"Teacher model built: {teacher_model.built}, Name: {teacher_model.name}")
-
-
-    # 7. Instantiate MeanTeacherTrainer
-    print("Instantiating MeanTeacherTrainer...")
-    mean_teacher_trainer = MeanTeacherTrainer(
-        student_model=student_model,
-        teacher_model=teacher_model,
-        # config=model_data_config, # This line was problematic for MeanTeacherTrainer's __init__ if it didn't expect 'config'
-        ema_decay=args.ema_decay
-        # Remove consistency_weight_max and consistency_rampup_epochs if not used by MeanTeacherTrainer's __init__
-        # These are now handled by the ConsistencyWeightScheduler callback and direct access to trainer.consistency_weight
+    tf.print(f"--- Starting Mean Teacher Training Phase ({args.num_epochs} epochs) ---")
+    start_time_mt = time.time()
+    history_mt = mean_teacher_trainer.fit(
+        train_dataset_mt, epochs=args.num_epochs, validation_data=validation_dataset_mt,
+        callbacks=callbacks_mt, verbose=args.verbose
     )
-
-    # 8. Compile the Trainer
-    print("Compiling MeanTeacherTrainer...")
-    optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
-    supervised_loss = DiceBCELoss(weight_bce=0.5, weight_dice=0.5) # Example weights
+    end_time_mt = time.time()
+    tf.print(f"Mean Teacher training phase completed in {(end_time_mt - start_time_mt)/60:.2f} minutes.")
     
-    # Custom metrics for the Mean Teacher model
-    # Define a custom metric for dice score calculation
-    class DiceCoefficient(tf.keras.metrics.Metric):
-        def __init__(self, name='dice_coefficient', **kwargs):
-            super().__init__(name=name, **kwargs)
-            self.total = self.add_weight(name='total', initializer='zeros')
-            self.count = self.add_weight(name='count', initializer='zeros')
-            self.smooth = 1e-6
+    plot_title_mt = f"Mean Teacher ({args.num_labeled} Labeled)"
+    plot_training_summary(history_mt, exp_config.results_dir / "mean_teacher_training_log.csv", plots_dir, plot_title_mt)
 
-        def update_state(self, y_true, y_pred_logits, sample_weight=None):
-            y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
-            # Apply sigmoid to logits
-            y_pred = tf.nn.sigmoid(y_pred_logits)
-            y_pred = tf.cast(tf.reshape(y_pred > 0.5, [-1]), tf.float32)
-            
-            intersection = tf.reduce_sum(y_true * y_pred)
-            dice = (2. * intersection + self.smooth) / (tf.reduce_sum(y_true) + tf.reduce_sum(y_pred) + self.smooth)
-            
-            self.total.assign_add(dice)
-            self.count.assign_add(1.0)
-            
-        def result(self):
-            return self.total / self.count
-            
-        def reset_state(self):
-            self.total.assign(0.)
-            self.count.assign(0.)
-    
-    # Create metric instances
-    student_dice_metric = DiceCoefficient(name='student_dice')
-    
-    mean_teacher_trainer.compile(
-        optimizer=optimizer,
-        supervised_loss_fn=supervised_loss,
-        metrics=[student_dice_metric] # Use the metric object instead of string name
-    )
-    print("MeanTeacherTrainer compiled.")
-
-    # 9. Define Callbacks
-    print("Setting up callbacks...")
-    callbacks = []
-    
-    # ModelCheckpoint: Save the best student model based on validation student dice
-    checkpoint_dir = exp_config.results_dir / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_filepath = checkpoint_dir / "best_student_model_epoch_{epoch:02d}_val_student_dice_{val_student_dice:.4f}.weights.h5" # Use .weights.h5 for save_weights_only
-    
-    model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
-        filepath=str(checkpoint_filepath),
-        save_weights_only=True, # Save only weights
-        monitor='val_student_dice', # Monitor student's dice score on validation set
-        mode='max',          # Maximize Dice score
-        save_best_only=True,
-        verbose=1
-    )
-    callbacks.append(model_checkpoint_callback)
-
-    # TensorBoard
-    log_dir = exp_config.results_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=str(log_dir), histogram_freq=1)
-    callbacks.append(tensorboard_callback)
-
-    # CSVLogger
-    csv_log_path = exp_config.results_dir / "training_log.csv"
-    csv_logger_callback = tf.keras.callbacks.CSVLogger(str(csv_log_path))
-    callbacks.append(csv_logger_callback)
-
-    # EarlyStopping
-    early_stopping_callback = tf.keras.callbacks.EarlyStopping(
-        monitor='val_student_dice',
-        patience=args.early_stopping_patience,
-        mode='max',
-        verbose=1,
-        restore_best_weights=True # Restore best weights found during training
-    )
-    callbacks.append(early_stopping_callback)
-
-    # Consistency Weight Scheduler
-    consistency_scheduler_callback = ConsistencyWeightScheduler(
-        consistency_weight_var=mean_teacher_trainer.consistency_weight, # Pass the trainer's variable
-        max_weight=args.consistency_max,
-        rampup_epochs=args.consistency_rampup
-    )
-    callbacks.append(consistency_scheduler_callback)
-    
-    # Learning Rate Scheduler (optional, Adam has adaptive LR)
-    # Example: ReduceLROnPlateau
-    # reduce_lr_callback = tf.keras.callbacks.ReduceLROnPlateau(
-    #     monitor='val_student_dice', factor=0.2, patience=10, mode='max', min_lr=1e-7, verbose=1)
-    # callbacks.append(reduce_lr_callback)
-
-
-    # 10. Start Training
-    print(f"Starting training for {args.num_epochs} epochs...")
-    start_time = time.time()
-    
-    history = mean_teacher_trainer.fit(
-        train_dataset,
-        epochs=args.num_epochs,
-        validation_data=validation_dataset,
-        callbacks=callbacks,
-        verbose=args.verbose
-    )
-
-    end_time = time.time()
-    print(f"Training completed in {(end_time - start_time)/60:.2f} minutes.")
-    print(f"Results, checkpoints, and logs saved in: {exp_config.results_dir}")
-
-    # Optionally, save the final student model explicitly
-    final_model_path = exp_config.results_dir / "final_student_model.weights.h5"
+    final_model_path = exp_config.results_dir / "final_mt_student_model.h5"
     student_model.save_weights(str(final_model_path))
-    print(f"Final student model weights saved to {final_model_path}")
+    tf.print(f"Final Mean Teacher student model weights saved to {final_model_path}")
+    tf.print(f"All results, checkpoints, and logs saved in: {exp_config.results_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Mean Teacher training for pancreas segmentation.")
-    
-    # Paths and Experiment Config
-    parser.add_argument("--data_dir", type=str, required=True, help="Root directory of the preprocessed data (e.g., /path/to/images/preprocessed_v2).")
-    parser.add_argument("--output_dir", type=str, default="./experiment_results", help="Directory to save experiment results.")
-    parser.add_argument("--experiment_name", type=str, default=f"mean_teacher_{time.strftime('%Y%m%d_%H%M%S')}", help="Name for the experiment.")
-
-    # Data Config
-    parser.add_argument("--img_size", type=int, default=256, help="Image size (height and width).")
-    parser.add_argument("--num_labeled", type=int, default=30, help="Number of labeled patient volumes for training.")
-    parser.add_argument("--num_validation", type=int, default=10, help="Number of patient volumes for validation.") # Adjusted from user's 56, as it might be too large for typical splits
-
-    # Training Hyperparameters
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.") # User mentioned 2, but 4 might be a good default
-    parser.add_argument("--num_epochs", type=int, default=150, help="Number of training epochs.")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Initial learning rate for Adam optimizer.")
-    parser.add_argument("--early_stopping_patience", type=int, default=20, help="Patience for early stopping.")
-    
-    # Mean Teacher Specific Hyperparameters
-    parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate for teacher model updates.")
-    parser.add_argument("--consistency_max", type=float, default=10.0, help="Maximum weight for the consistency loss.") # Typical values are 1.0 to 100.0
-    parser.add_argument("--consistency_rampup", type=int, default=30, help="Number of epochs for consistency weight ramp-up.")
-
-    parser.add_argument("--verbose", type=int, default=1, choices=[0,1,2], help="Verbosity mode for training (0 = silent, 1 = progress bar, 2 = one line per epoch).")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
-
-
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="./experiment_results")
+    parser.add_argument("--experiment_name", type=str, default=f"MT_Pretrain_{time.strftime('%Y%m%d_%H%M%S')}")
+    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--num_labeled", type=int, default=30)
+    parser.add_argument("--num_validation", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--student_pretrain_epochs", type=int, default=10, help="Epochs for supervised pre-training of student.")
+    parser.add_argument("--num_epochs", type=int, default=100, help="Epochs for Mean Teacher training phase.")
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--early_stopping_patience", type=int, default=20)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--consistency_max", type=float, default=10.0)
+    parser.add_argument("--consistency_rampup", type=int, default=30, help="Epochs for consistency weight ramp-up IN MT PHASE.")
+    parser.add_argument("--verbose", type=int, default=1, choices=[0,1,2])
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     
-    # Set random seeds for reproducibility
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    tf.random.set_seed(args.seed)
-
+    random.seed(args.seed); np.random.seed(args.seed); tf.random.set_seed(args.seed)
     main(args)

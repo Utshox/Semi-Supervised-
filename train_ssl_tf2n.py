@@ -776,6 +776,7 @@ class MeanTeacherTrainer(tf.keras.Model):
         # For now, compiled_metrics should cover student_dice. Teacher_dice is handled in test_step directly.
         return metrics
 
+    # In class MeanTeacherTrainer(tf.keras.Model):
     def train_step(self, data):
         labeled_data, unlabeled_data = data
         labeled_images, true_labels = labeled_data
@@ -784,7 +785,10 @@ class MeanTeacherTrainer(tf.keras.Model):
         with tf.GradientTape() as tape:
             # Supervised loss on labeled data
             student_labeled_logits = self.student_model(labeled_images, training=True)
-            supervised_loss = self.compiled_loss(true_labels, student_labeled_logits) # Uses loss_fn from compile
+            # Add regularization_losses if your student_model has any (e.g. from Dense layers with kernel_regularizer)
+            # If not, self.student_model.losses will be an empty list.
+            supervised_loss = self.compiled_loss(true_labels, student_labeled_logits, regularization_losses=self.student_model.losses)
+
 
             # Consistency loss on unlabeled data
             student_unlabeled_logits = self.student_model(unlabeled_student_input, training=True)
@@ -804,23 +808,18 @@ class MeanTeacherTrainer(tf.keras.Model):
         # Update teacher model using EMA
         self._update_teacher_model()
 
-        # Calculate student dice score (manually, not using compiled_metrics)
-        student_dice = self._calculate_dice(true_labels, student_labeled_logits)
-        
-        # Update metrics
+        # Update compiled metrics (this includes 'student_dice' Keras metric object)
         self.compiled_metrics.update_state(true_labels, student_labeled_logits)
 
-        # Prepare logs
+        # Prepare logs: return TENSORS. Keras will handle them.
         logs = {
-            'loss': total_loss, 
-            'supervised_loss': supervised_loss, 
-            'consistency_loss': consistency_loss_value,
-            'student_dice': student_dice  # Add student_dice directly
+            'loss': total_loss, # This is a tensor
+            'supervised_loss': supervised_loss, # This is a tensor
+            'consistency_loss': consistency_loss_value # This is a tensor
         }
-        
-        # Add metrics from the compiled_metrics
-        for metric in self.metrics:
-            logs[metric.name] = metric.result()
+        # Add results from compiled metrics (e.g., student_dice)
+        for metric in self.metrics: # self.metrics already includes metrics from compile()
+            logs[metric.name] = metric.result() # metric.result() is a tensor
         
         return logs
 
