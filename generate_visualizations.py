@@ -188,7 +188,7 @@ def main():
             trainers[method] = load_trainer(method, config, data_pipeline, method_model_dir)
         
         # Get predictions from each method for comparison
-        for i, (images, masks) in enumerate(datasets['validation'].take(10)):
+        for i, (images, masks) in enumerate(datasets['validation'].take(20)):
             val_images.extend(images.numpy())
             val_masks.extend(masks.numpy())
             

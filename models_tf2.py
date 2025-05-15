@@ -1,15 +1,15 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 import numpy as np
-
 class UNetBlock(layers.Layer):
     """
-    Basic U-Net convolutional block with batch normalization and modern activation
+    Basic U-Net convolutional block with batch normalization
     """
-    def __init__(self, filters, name='unet_block', activation='relu', **kwargs):
+class UNetBlock(layers.Layer):
+    """Basic U-Net convolutional block with batch normalization"""
+    def __init__(self, filters, name='unet_block', **kwargs):
         super(UNetBlock, self).__init__(name=name, **kwargs)
         self.filters = filters
-        self.activation_type = activation
 
         # First convolution
         self.conv1 = layers.Conv2D(
@@ -30,33 +30,22 @@ class UNetBlock(layers.Layer):
             name=f'{name}_conv2'
         )
         self.bn2 = layers.BatchNormalization(name=f'{name}_bn2')
-        
-        # Use modern activation options
-        if activation == 'relu':
-            self.activation = tf.nn.relu
-        elif activation == 'leaky_relu':
-            self.activation = lambda x: tf.nn.leaky_relu(x, alpha=0.2)
-        elif activation == 'gelu':
-            self.activation = lambda x: tf.nn.gelu(x)
-        else:
-            self.activation = tf.nn.relu  # Default fallback
 
     def call(self, inputs, training=False):
         x = self.conv1(inputs)
         x = self.bn1(x, training=training)
-        x = self.activation(x)
+        x = tf.nn.relu(x)
 
         x = self.conv2(x)
         x = self.bn2(x, training=training)
-        x = self.activation(x)
+        x = tf.nn.relu(x)
 
         return x
 
     def get_config(self):
         config = super().get_config()
         config.update({
-            "filters": self.filters,
-            "activation_type": self.activation_type
+            "filters": self.filters
         })
         return config
 
@@ -69,27 +58,28 @@ class PancreasSeg(Model):
           
           self.img_size = (config.img_size_x, config.img_size_y)
           self.num_classes = config.num_classes
+          n_filters = config.n_filters # Use base filter number from config
 
-          # Encoder blocks with increasing filters
-          self.enc1 = UNetBlock(filters=64, name='enc1')
-          self.enc2 = UNetBlock(filters=128, name='enc2')
-          self.enc3 = UNetBlock(filters=256, name='enc3')
-          self.enc4 = UNetBlock(filters=512, name='enc4')
+          # Encoder blocks with increasing filters based on config.n_filters
+          self.enc1 = UNetBlock(filters=n_filters, name='enc1') # e.g., 32
+          self.enc2 = UNetBlock(filters=n_filters*2, name='enc2') # e.g., 64
+          self.enc3 = UNetBlock(filters=n_filters*4, name='enc3') # e.g., 128
+          self.enc4 = UNetBlock(filters=n_filters*8, name='enc4') # e.g., 256
 
           # Bridge
-          self.bridge = UNetBlock(filters=1024, name='bridge')
+          self.bridge = UNetBlock(filters=n_filters*16, name='bridge') # e.g., 512
 
           # Decoder blocks with decreasing filters
-          self.dec4 = UNetBlock(filters=512, name='dec4')
-          self.dec3 = UNetBlock(filters=256, name='dec3')
-          self.dec2 = UNetBlock(filters=128, name='dec2')
-          self.dec1 = UNetBlock(filters=64, name='dec1')
+          self.dec4 = UNetBlock(filters=n_filters*8, name='dec4') # e.g., 256
+          self.dec3 = UNetBlock(filters=n_filters*4, name='dec3') # e.g., 128
+          self.dec2 = UNetBlock(filters=n_filters*2, name='dec2') # e.g., 64
+          self.dec1 = UNetBlock(filters=n_filters, name='dec1') # e.g., 32
 
-          # Upsampling layers
-          self.up4 = layers.UpSampling2D(size=(2, 2), name='up4')
-          self.up3 = layers.UpSampling2D(size=(2, 2), name='up3')
-          self.up2 = layers.UpSampling2D(size=(2, 2), name='up2')
-          self.up1 = layers.UpSampling2D(size=(2, 2), name='up1')
+          # Upsampling layers - Replace UpSampling2D with Conv2DTranspose
+          self.up4 = layers.Conv2DTranspose(filters=n_filters*16, kernel_size=2, strides=2, padding='same', name='up4_trans') # Input 512 -> Output 512 channels, 2x size
+          self.up3 = layers.Conv2DTranspose(filters=n_filters*8, kernel_size=2, strides=2, padding='same', name='up3_trans')  # Input 256 -> Output 256 channels, 2x size
+          self.up2 = layers.Conv2DTranspose(filters=n_filters*4, kernel_size=2, strides=2, padding='same', name='up2_trans')  # Input 128 -> Output 128 channels, 2x size
+          self.up1 = layers.Conv2DTranspose(filters=n_filters*2, kernel_size=2, strides=2, padding='same', name='up1_trans')  # Input 64 -> Output 64 channels, 2x size
 
           # Max pooling layers
           self.pool = layers.MaxPooling2D(pool_size=(2, 2))
@@ -98,9 +88,9 @@ class PancreasSeg(Model):
           self.final_conv = layers.Conv2D(
               filters=self.num_classes,
               kernel_size=1,
-              activation=None,
+              activation=None, # Output logits
               kernel_initializer=tf.keras.initializers.HeNormal(),
-              bias_initializer=tf.keras.initializers.Constant(-2.19)
+              bias_initializer='zeros' # Changed from Constant(-2.19)
           )
           
           # Initialize with a dummy input to create weights
@@ -163,43 +153,7 @@ class PancreasSeg(Model):
         projections = self.projection(bridge, training=training)
         return projections
 
-# class DiceLoss(tf.keras.losses.Loss):
-#     def __init__(self, smooth=1e-6):
-#         super().__init__()
-#         self.smooth = smooth
 
-#     def call(self, y_true, y_pred):
-#         print("Dice Loss input shapes - y_true:", y_true.shape, "y_pred:", y_pred.shape)
-        
-#         # Focus on foreground class only
-#         y_true = y_true[..., -1]  # Take last channel (pancreas)
-#         y_pred = y_pred[..., -1]  # Take last channel (pancreas)
-
-#         # Add channel dimension back
-#         y_true = tf.expand_dims(y_true, axis=-1)
-#         y_pred = tf.expand_dims(y_pred, axis=-1)
-
-#         print("After channel selection - y_true:", y_true.shape, "y_pred:", y_pred.shape)
-#         print("y_true values range:", tf.reduce_min(y_true).numpy(), tf.reduce_max(y_true).numpy())
-#         print("y_pred values range:", tf.reduce_min(y_pred).numpy(), tf.reduce_max(y_pred).numpy())
-
-#         # Apply sigmoid to predictions
-#         y_pred = tf.nn.sigmoid(y_pred)
-#         print("After sigmoid - y_pred range:", tf.reduce_min(y_pred).numpy(), tf.reduce_max(y_pred).numpy())
-
-#         # Calculate intersection and union
-#         intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2])
-#         union = tf.reduce_sum(y_true, axis=[1, 2]) + tf.reduce_sum(y_pred, axis=[1, 2])
-        
-#         # Print debug information
-#         print("Intersection range:", tf.reduce_min(intersection).numpy(), tf.reduce_max(intersection).numpy())
-#         print("Union range:", tf.reduce_min(union).numpy(), tf.reduce_max(union).numpy())
-
-#         # Calculate Dice coefficient
-#         dice = (2. * intersection + self.smooth) / (union + self.smooth)
-#         print("Dice scores:", tf.reduce_mean(dice).numpy())
-
-#         return 1.0 - tf.reduce_mean(dice)
 class CombinedLoss(tf.keras.losses.Loss):
     def __init__(self, config, smooth=1e-6, alpha = 0.25, gamma = 2):
         super().__init__()
