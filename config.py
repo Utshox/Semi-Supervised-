@@ -1,9 +1,12 @@
-from dataclasses import dataclass,field
+# In config.py
+
+from dataclasses import dataclass, field
 from pathlib import Path
 import time
 
 @dataclass
 class ExperimentConfig:
+    # ... (no changes here) ...
     experiment_name: str
     experiment_type: str  # 'supervised' or 'semi-supervised'
     timestamp: str = field(default_factory=lambda: time.strftime("%Y%m%d_%H%M%S"))
@@ -34,25 +37,26 @@ class StableSSLConfig:
     initial_filters: int = 32
     n_filters: int = 32  # Added n_filters attribute to match what the model is looking for
     filters: list = field(default_factory=lambda: [32, 64, 128, 256, 512])  # Added filters list
-    dropout_rate: float = 0.2
+    dropout_rate: float = 0.1
     use_batch_norm: bool = True
     
-    # Training parameters
+    # Training parameters (can be general or overridden by specific trainers)
     num_epochs: int = 100
-    initial_learning_rate: float = 0.00001
-    min_learning_rate: float = 1e-6
-    warmup_epochs: int = 5
-    learning_rate: float = 0.00001  # Added for consistency with training_config
-    weight_decay: float = 1e-5  # Added for consistency with training_config
+    initial_learning_rate: float = 0.00001 # General initial LR, often overridden
+    min_learning_rate: float = 1e-6      # General min LR for some schedulers
+    warmup_epochs: int = 5               # General warmup epochs for some schedulers
+    learning_rate: float = 0.0001        # More specific LR, often set by script args
+    weight_decay: float = 1e-5           # General weight decay
+    lr_decay_steps: int = 500            # For schedulers like CosineDecayRestarts
     
-    # SSL specific parameters
-    ema_decay: float = 0.999
-    consistency_weight: float = 0.1
-    consistency_rampup_epochs: int = 5
+    # SSL specific parameters (general, can be used by MeanTeacher or others)
+    ema_decay: float = 0.999             # Final/Base EMA decay
+    consistency_weight: float = 0.1      # General consistency weight, often overridden
+    consistency_rampup_epochs: int = 5   # General ramp-up epochs, often overridden by steps
     
     # Loss function parameters
     dice_smooth: float = 1e-6
-    temperature: float = 0.5
+    temperature: float = 0.5 # General temperature, can be for contrastive or sharpening
     
     # Training stability
     gradient_clip_norm: float = 2.0
@@ -63,32 +67,53 @@ class StableSSLConfig:
     noise_std: float = 0.1
     rotation_range: float = 15
     zoom_range: float = 0.1
-    scale_range: tuple = (0.9, 1.1)  # Added for augmentation_config
-    brightness_range: tuple = (0.9, 1.1)  # Added for augmentation_config
-    contrast_range: tuple = (0.9, 1.1)  # Added for augmentation_config
-    elastic_deform_sigma: float = 20.0  # Added for augmentation_config
-    elastic_deform_alpha: float = 500.0  # Added for augmentation_config
+    scale_range: tuple = (0.9, 1.1)
+    brightness_range: tuple = (0.9, 1.1)
+    contrast_range: tuple = (0.9, 1.1)
+    elastic_deform_sigma: float = 20.0
+    elastic_deform_alpha: float = 500.0
     
-    # Paths
-    checkpoint_dir: Path = Path('ssl_checkpoints')
-    log_dir: Path = Path('ssl_logs')
-    output_dir: Path = Path('ssl_results')
+    # Paths (can be overridden by specific experiment setup)
+    checkpoint_dir: Path = Path('ssl_checkpoints_default') # Default, will be overridden
+    log_dir: Path = Path('ssl_logs_default')               # Default, will be overridden
+    output_dir: Path = Path('ssl_results_default')         # Default, often base for experiment outputs
+    experiment_name: str = "DefaultExperiment"             # Default, will be overridden
     
+    # --- ADD THESE MIXMATCH SPECIFIC FIELDS ---
+    mixmatch_T: float = 0.5
+    mixmatch_K: int = 2
+    mixmatch_alpha: float = 0.75
+    mixmatch_consistency_max: float = 10.0
+    mixmatch_rampup_steps: int = 1000 # Rampup in steps for MixMatch consistency
+
+    # --- ADD THESE EMA SPECIFIC FIELDS (can also be used by MeanTeacher if adapted) ---
+    initial_ema_decay: float = 0.95
+    # ema_decay is already defined above as the final/base EMA decay
+    ema_warmup_steps: int = 1000 # Steps for EMA decay to ramp up
+
+    # --- END OF ADDED FIELDS ---
+
     def __post_init__(self):
-        """Create necessary directories after initialization"""
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        """Create necessary directories after initialization if they use defaults"""
+        # Check if paths are still the default Path objects before creating.
+        # If they were overridden by strings/Paths during init, this might not be desired.
+        # For now, let's assume if output_dir is set, it handles its subdirs.
+        if self.output_dir == Path('ssl_results_default'): # Only create if using default
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            (self.output_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+            (self.output_dir / "logs").mkdir(parents=True, exist_ok=True)
         
     @property
     def training_steps_per_epoch(self):
         """Calculate training steps per epoch based on dataset size"""
-        return 100  # Adjust based on your dataset size
+        # This is a placeholder, actual steps_per_epoch should be determined by trainer or args
+        return 100
         
     @property
-    def consistency_rampup_steps(self):
-        """Calculate total steps for consistency loss ramp-up"""
-        return self.consistency_rampup_epochs * self.training_steps_per_epoch
+    def consistency_rampup_steps(self): # General consistency ramp-up in steps
+        """Calculate total steps for general consistency loss ramp-up"""
+        # If mixmatch_rampup_steps is defined, it should take precedence for MixMatch
+        return getattr(self, 'mixmatch_rampup_steps', self.consistency_rampup_epochs * self.training_steps_per_epoch)
 
     @property
     def model_config(self):

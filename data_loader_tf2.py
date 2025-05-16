@@ -10,14 +10,6 @@ import math
 # Define AUTOTUNE for tf.data
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 
-# data_loader_tf2.py
-
-# ... (imports and other class/functions remain the same) ...
-
-# data_loader_tf2.py
-
-# ... (imports and other class/functions remain the same) ...
-
 class PancreasDataLoader:
     def __init__(self, config):
         self.config = config
@@ -184,7 +176,45 @@ class PancreasDataLoader:
         except Exception as e:
             tf.print(f"ERROR PDL.preprocess_volume: Unexpected error for '{image_path_str_py}': {type(e).__name__} - {str(e)}", output_stream=sys.stderr)
             return None if label_path_str_py is None else (None, None)
+        
+    def create_unlabeled_dataset_for_mixmatch(self, image_paths, batch_size, shuffle=True):
+        """
+        Creates a dataset of unlabeled images for MixMatch.
+        Yields batches of single-view image slices (raw or very minimally processed).
+        The K-augmentations for pseudo-labeling and strong augmentation for student
+        consistency input will be handled within the MixMatchTrainer's train_step.
+        """
+        if not image_paths:
+            tf.print("WARNING PDL.create_unlabeled_dataset_for_mixmatch: received empty image_paths.", output_stream=sys.stderr)
+            # Yield an empty tensor with correct rank but 0 batch size to avoid issues downstream if possible
+            # Or make the dataset yield a single dummy batch if that's easier for trainer logic
+            return tf.data.Dataset.from_tensor_slices(
+                tf.zeros([0, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=tf.float32)
+            ).batch(batch_size)
 
+
+        dataset = tf.data.Dataset.from_tensor_slices(image_paths)
+        if shuffle:
+            dataset = dataset.shuffle(buffer_size=len(image_paths), reshuffle_each_iteration=True)
+
+        dataset = dataset.interleave(
+            lambda img_path_tensor: tf.data.Dataset.from_generator(
+                self._parse_volume_to_slices_unlabeled, # Yields single raw slices from volume
+                args=(img_path_tensor,),
+                output_signature=tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32)
+            ),
+            cycle_length=tf.data.AUTOTUNE, # Use AUTOTUNE
+            num_parallel_calls=tf.data.AUTOTUNE,
+            deterministic=not shuffle
+        )
+        
+        # Filter out any dummy/error slices if _parse_volume_to_slices_unlabeled might produce them
+        # For MixMatch, it's crucial that we get valid images.
+        # dataset = dataset.filter(lambda img_slice: tf.reduce_sum(tf.cast(tf.shape(img_slice) > 0, tf.int32)) == 3 ) # Ensure H,W,C > 0
+
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        return dataset
 # ... (rest of DataPipeline and other functions/classes in data_loader_tf2.py remain the same) ...
 
     @tf.function
@@ -258,194 +288,236 @@ class PancreasDataLoader:
 class DataPipeline:
     def __init__(self, config):
         self.config = config
-        self.dataloader = PancreasDataLoader(config) # PancreasDataLoader instance
+        self.dataloader = PancreasDataLoader(config)
 
-# In class DataPipeline:
     def _py_load_preprocess_volume_wrapper(self, image_path_input, label_path_input=None):
-        """
-        Wrapper for tf.py_function that calls PancreasDataLoader.preprocess_volume.
-        Handles tensor to Python string conversion and returns numpy arrays.
-        Input 'image_path_input' and 'label_path_input' can be tf.string Tensors or Python bytes.
-        """
-        
-        # --- Robust path decoding ---
         def decode_path(path_input):
-            if isinstance(path_input, tf.Tensor): # If it's a TensorFlow EagerTensor
-                # tf.print(f"DEBUG _py_decode_path: Decoding TF Tensor: {path_input}", output_stream=sys.stderr)
-                return path_input.numpy().decode('utf-8')
-            elif isinstance(path_input, bytes): # If it's already Python bytes
-                # tf.print(f"DEBUG _py_decode_path: Decoding Python bytes: {path_input}", output_stream=sys.stderr)
-                return path_input.decode('utf-8')
-            elif isinstance(path_input, str): # If it's already a Python string (should not happen from generator)
-                # tf.print(f"DEBUG _py_decode_path: Path is already string: {path_input}", output_stream=sys.stderr)
-                return path_input
-            elif path_input is None:
-                return None
-            else:
-                tf.print(f"ERROR _py_decode_path: Unexpected path type {type(path_input)}, value: {path_input}", output_stream=sys.stderr)
-                return None # Or raise an error
+            if isinstance(path_input, tf.Tensor): return path_input.numpy().decode('utf-8')
+            elif isinstance(path_input, bytes): return path_input.decode('utf-8')
+            elif isinstance(path_input, str): return path_input
+            return None
 
         image_path_str = decode_path(image_path_input)
-        if image_path_str is None:
-            tf.print(f"ERROR _py_load_wrapper: Failed to decode image_path_input.", output_stream=sys.stderr)
-            # Fallback for error: return dummy data matching expected Tout signature
-            if label_path_input is not None and decode_path(label_path_input) is not None: # Trying to determine if it was a supervised call
-                return np.zeros([1, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=np.float32), \
-                       np.zeros([1, self.config.img_size_y, self.config.img_size_x, 1], dtype=np.float32)
-            else:
-                return np.zeros([1, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=np.float32)
-
-
-        label_path_str = None
-        is_supervised_call = False
-        if label_path_input is not None:
-            decoded_label_path = decode_path(label_path_input)
-            if decoded_label_path: # If decoding was successful and not None
-                label_path_str = decoded_label_path
-                is_supervised_call = True
+        label_path_str = decode_path(label_path_input) if label_path_input is not None else None
         
-        # tf.print(f"DEBUG _py_load_wrapper: Decoded image_path='{image_path_str}', label_path='{label_path_str}'", output_stream=sys.stderr)
+        if image_path_str is None: # Critical if image path cannot be decoded
+            tf.print(f"ERROR _py_load_wrapper: Failed to decode image_path_input: {image_path_input}", output_stream=sys.stderr)
+            # Return dummy data matching Tout signature
+            dummy_depth = 1
+            dummy_img_vol = np.zeros([dummy_depth, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=np.float32)
+            if label_path_input is not None: # Assuming supervised call if label_path_input was provided
+                dummy_lbl_vol = np.zeros([dummy_depth, self.config.img_size_y, self.config.img_size_x, 1], dtype=np.float32)
+                return dummy_img_vol, dummy_lbl_vol
+            return dummy_img_vol
 
-        # Call the actual preprocessing function
         result = self.dataloader.preprocess_volume(image_path_str, label_path_str)
 
-        # Handle return based on whether it's supervised or unlabeled
+        is_supervised_call = label_path_str is not None
+        dummy_depth = 1
+        dummy_img_vol = np.zeros([dummy_depth, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=np.float32)
+
         if is_supervised_call:
             img_data, lbl_data = result if result is not None and isinstance(result, tuple) and len(result) == 2 else (None, None)
             if img_data is None or lbl_data is None: 
-                # tf.print(f"DEBUG _py_load_wrapper: Preprocessing returned None for supervised. Img: {image_path_str}, Lbl: {label_path_str}", output_stream=sys.stderr)
-                return np.zeros([1, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=np.float32), \
-                       np.zeros([1, self.config.img_size_y, self.config.img_size_x, 1], dtype=np.float32)
+                dummy_lbl_vol = np.zeros([dummy_depth, self.config.img_size_y, self.config.img_size_x, 1], dtype=np.float32)
+                return dummy_img_vol, dummy_lbl_vol
             return img_data.astype(np.float32), lbl_data.astype(np.float32)
-        else: # Unlabeled call
+        else:
             img_data = result
-            if img_data is None: 
-                # tf.print(f"DEBUG _py_load_wrapper: Preprocessing returned None for unlabeled. Img: {image_path_str}", output_stream=sys.stderr)
-                return np.zeros([1, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=np.float32)
+            if img_data is None: return dummy_img_vol
             return img_data.astype(np.float32)
 
     def _parse_volume_to_slices_supervised(self, image_path_tensor, label_path_tensor):
-        # Generator function to yield individual 2D slices
-        # Wrapped by tf.py_function, so inputs are Tensors
         img_vol_np, lbl_vol_np = self._py_load_preprocess_volume_wrapper(image_path_tensor, label_path_tensor)
-        
-        # If loading failed, img_vol_np will be a dummy array of depth 1. Loop will run once.
-        for i in range(img_vol_np.shape[0]):
-            yield img_vol_np[i], lbl_vol_np[i] # Yields [H,W,C_img], [H,W,1]
+        for i in range(img_vol_np.shape[0]): yield img_vol_np[i], lbl_vol_np[i]
 
     def _parse_volume_to_slices_unlabeled(self, image_path_tensor):
-        # Generator function to yield individual 2D image slices
         img_vol_np = self._py_load_preprocess_volume_wrapper(image_path_tensor, None)
+        for i in range(img_vol_np.shape[0]): yield img_vol_np[i]
+
+    # --- NEW: Stateless geometric augmentation for a single image slice (for unlabeled data) ---
+    @tf.function
+    def _stateless_geometric_augment_single_slice(self, image_slice, seed_pair):
+        # image_slice: [H, W, C]
+        # Unpack seeds from the pair for stateless operations
+        seed1, seed2 = seed_pair[0], seed_pair[1] 
+        s_lr = tf.random.experimental.stateless_split(tf.stack([seed1, seed2]), num=1)[0, :]
+        s_ud = tf.random.experimental.stateless_split(s_lr, num=1)[0, :] 
+        s_rot = tf.random.experimental.stateless_split(s_ud, num=1)[0, :]
+
+        if tf.random.stateless_uniform(shape=[], seed=s_lr, minval=0, maxval=1) > 0.5:
+            image_slice = tf.image.flip_left_right(image_slice)
+        if tf.random.stateless_uniform(shape=[], seed=s_ud, minval=0, maxval=1) > 0.5:
+            image_slice = tf.image.flip_up_down(image_slice)
         
-        # If loading failed, img_vol_np will be a dummy array of depth 1. Loop will run once.
-        for i in range(img_vol_np.shape[0]):
-            yield img_vol_np[i] # Yields [H,W,C_img]
+        k_rot = tf.random.stateless_uniform(shape=[], seed=s_rot, minval=0, maxval=4, dtype=tf.int32)
+        image_slice = tf.image.rot90(image_slice, k=k_rot)
+        return image_slice
+    # --- END NEW ---
+
+    # --- MODIFIED: To use the new geometric augmentation for UNLABELED data ---
+    def _augment_for_mean_teacher(self, image_slice, seed_pair_student_geom, seed_pair_teacher_geom):
+        # Now it directly accepts the three arguments passed by dataset.map()
+        # No need to unpack a tuple here.
+        
+        # Student: distinct geometric + strong intensity
+        student_view_geom = self._stateless_geometric_augment_single_slice(image_slice, seed_pair_student_geom)
+        student_view = self.dataloader._augment_single_image_slice(student_view_geom, strength='strong')
+
+        # Teacher: distinct geometric + weak intensity
+        teacher_view_geom = self._stateless_geometric_augment_single_slice(image_slice, seed_pair_teacher_geom)
+        teacher_view = self.dataloader._augment_single_image_slice(teacher_view_geom, strength='weak')
+        
+        student_view = tf.ensure_shape(student_view, [self.config.img_size_y, self.config.img_size_x, self.config.num_channels])
+        teacher_view = tf.ensure_shape(teacher_view, [self.config.img_size_y, self.config.img_size_x, self.config.num_channels])
+        return student_view, teacher_view
+    # --- END MODIFIED ---
 
     def build_labeled_dataset(self, image_paths, label_paths, batch_size, is_training=True):
         if not image_paths or not label_paths:
-            tf.print("WARNING: build_labeled_dataset received empty image_paths or label_paths.", output_stream=sys.stderr)
-            return tf.data.Dataset.from_tensor_slices(([], [])).batch(batch_size) # Return empty batched dataset
+            tf.print("WARNING: build_labeled_dataset empty paths.", output_stream=sys.stderr)
+            return tf.data.Dataset.from_tensor_slices(([], [])).batch(batch_size)
 
         dataset = tf.data.Dataset.from_tensor_slices((image_paths, label_paths))
-        
-        if is_training:
-            dataset = dataset.shuffle(buffer_size=len(image_paths))
+        if is_training: dataset = dataset.shuffle(buffer_size=len(image_paths))
 
         dataset = dataset.interleave(
-            lambda img_path_tensor, lbl_path_tensor: tf.data.Dataset.from_generator(
-                self._parse_volume_to_slices_supervised,
-                args=(img_path_tensor, lbl_path_tensor),
+            lambda img_p, lbl_p: tf.data.Dataset.from_generator(
+                self._parse_volume_to_slices_supervised, args=(img_p, lbl_p),
                 output_signature=(
                     tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32),
-                    tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, 1), dtype=tf.float32)
-                )
-            ),
-            cycle_length=4, # Process 4 files concurrently
-            num_parallel_calls=AUTOTUNE,
-            deterministic=not is_training
-        )
-        
-        # Filter out dummy slices (which have depth 1 and all zeros from the error handling)
-        # A real slice might be all zeros, but a dummy error slice also has specific small depth.
-        # This filter assumes successfully processed volumes have depth > 1.
-        # If preprocess_volume now returns actual data (even if 1 slice), this filter might not be needed
-        # or might need adjustment. Let's remove it for now and rely on preprocess_volume handling.
-        # dataset = dataset.filter(lambda img, lbl: tf.shape(img)[0] > 0) # tf.shape(img)[0] is H for a slice here
+                    tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, 1), dtype=tf.float32))),
+            cycle_length=tf.data.AUTOTUNE, num_parallel_calls=AUTOTUNE, deterministic=not is_training)
         
         if is_training:
-            # Augment after slices are generated
-            seed_dataset = tf.data.Dataset.counter().map(lambda x: (x, x + 100000)) # Generate pairs of seeds
+            # Seed dataset for LABELED data geometric augmentations
+            seed_dataset_labeled_geom = tf.data.Dataset.counter().map(lambda x: (x, x + tf.cast(4e5, tf.int64))) # Different seed range
 
-            dataset = tf.data.Dataset.zip((dataset, seed_dataset))
+            dataset = tf.data.Dataset.zip((dataset, seed_dataset_labeled_geom))
             dataset = dataset.map(
                 lambda data_pair, seed_pair: self.dataloader._augment_slice_and_label(data_pair[0], data_pair[1], seed_pair),
+                num_parallel_calls=AUTOTUNE)
+            # Intensity augmentations for LABELED data (can be added here if needed, or if _augment_slice_and_label is only geometric)
+            # For now, assuming _augment_slice_and_label includes all necessary augmentations for labeled data.
+            # Or, if PancreasDataLoader._augment_single_image_slice should also be applied:
+            # dataset = dataset.map(
+            #     lambda img, lbl: (self.dataloader._augment_single_image_slice(img, strength='strong'), lbl),
+            #     num_parallel_calls=AUTOTUNE
+            # )
+            dataset = dataset.shuffle(buffer_size=1000)
+
+        dataset = dataset.batch(batch_size); dataset = dataset.prefetch(buffer_size=AUTOTUNE)
+        return dataset
+
+    # --- MODIFIED: To provide distinct seeds for student and teacher geometric augmentations ---
+    def build_unlabeled_dataset_for_mean_teacher(self, image_paths, batch_size, is_training=True):
+        if not image_paths:
+            tf.print("WARNING: build_unlabeled_dataset_for_mean_teacher empty paths.", output_stream=sys.stderr)
+            # Return a dataset that yields pairs, even if empty, to satisfy zip
+            return tf.data.Dataset.from_tensor_slices(([], [])).batch(batch_size) 
+
+        dataset = tf.data.Dataset.from_tensor_slices(image_paths)
+        if is_training: dataset = dataset.shuffle(buffer_size=len(image_paths))
+
+        dataset = dataset.interleave(
+            lambda img_p: tf.data.Dataset.from_generator(
+                self._parse_volume_to_slices_unlabeled, args=(img_p,),
+                output_signature=tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32)),
+            cycle_length=tf.data.AUTOTUNE, num_parallel_calls=AUTOTUNE, deterministic=not is_training)
+        
+        if is_training:
+            # Create two independent seed datasets for student and teacher geometric augmentations
+            # Using tf.data.Dataset.random() for better seed generation if available and TF version supports it,
+            # otherwise, tf.data.Dataset.counter() with different offsets is a good approximation.
+            seed_dataset_student_geom = tf.data.Dataset.counter().map(lambda x: (x, x + tf.cast(1e5, tf.int64))) 
+            seed_dataset_teacher_geom = tf.data.Dataset.counter().map(lambda x: (x + tf.cast(2e5, tf.int64), x + tf.cast(3e5, tf.int64)))
+
+            dataset_with_seeds = tf.data.Dataset.zip((dataset, seed_dataset_student_geom, seed_dataset_teacher_geom))
+            
+            dataset = dataset_with_seeds.map(
+                self._augment_for_mean_teacher, # This now expects (image_slice, seed_stud_geom, seed_teach_geom)
                 num_parallel_calls=AUTOTUNE
             )
             dataset = dataset.shuffle(buffer_size=1000)
 
-        dataset = dataset.batch(batch_size)
-        dataset = dataset.prefetch(buffer_size=AUTOTUNE)
+        dataset = dataset.batch(batch_size); dataset = dataset.prefetch(buffer_size=AUTOTUNE)
+        return dataset
+    # --- END MODIFIED ---
+
+    def build_validation_dataset(self, image_paths, label_paths, batch_size):
+        if not image_paths or not label_paths:
+            tf.print("WARNING: build_validation_dataset empty paths.", output_stream=sys.stderr)
+            return tf.data.Dataset.from_tensor_slices(([], [])).batch(batch_size)
+
+        dataset = tf.data.Dataset.from_tensor_slices((image_paths, label_paths))
+        dataset = dataset.interleave(
+            lambda img_p, lbl_p: tf.data.Dataset.from_generator(
+                self._parse_volume_to_slices_supervised, args=(img_p, lbl_p), # No augmentation for validation
+                output_signature=(
+                    tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32),
+                    tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, 1), dtype=tf.float32))),
+            cycle_length=tf.data.AUTOTUNE, num_parallel_calls=AUTOTUNE, deterministic=True)
+        
+        dataset = dataset.batch(batch_size); dataset = dataset.prefetch(buffer_size=AUTOTUNE)
         return dataset
 
-    def _augment_for_mean_teacher(self, image_slice):
-        # image_slice is an unaugmented, resized slice [H,W,C]
-        student_input = self.dataloader._augment_single_image_slice(image_slice, strength='strong')
-        teacher_input = self.dataloader._augment_single_image_slice(image_slice, strength='weak')
-        return student_input, teacher_input
 
-    def build_unlabeled_dataset_for_mean_teacher(self, image_paths, batch_size, is_training=True):
+    def build_unlabeled_dataset_for_mixmatch(self, image_paths, batch_size, is_training=True):
         if not image_paths:
-            tf.print("WARNING: build_unlabeled_dataset_for_mean_teacher received empty image_paths.", output_stream=sys.stderr)
-            return tf.data.Dataset.from_tensor_slices(([], [])).batch(batch_size) # Needs to yield pairs
+            # tf.print("WARNING DP.build_unlabeled_for_MixMatch: empty image_paths.", output_stream=sys.stderr)
+            return tf.data.Dataset.from_tensor_slices(
+                 (tf.zeros([0, self.config.img_size_y, self.config.img_size_x, self.config.num_channels], dtype=tf.float32),) # Tuple with one element
+            ).batch(batch_size)
 
         dataset = tf.data.Dataset.from_tensor_slices(image_paths)
-
         if is_training:
-            dataset = dataset.shuffle(buffer_size=len(image_paths))
+            dataset = dataset.shuffle(buffer_size=len(image_paths), reshuffle_each_iteration=True)
 
         dataset = dataset.interleave(
-            lambda img_path_tensor: tf.data.Dataset.from_generator(
-                self._parse_volume_to_slices_unlabeled,
-                args=(img_path_tensor,),
+            lambda img_p: tf.data.Dataset.from_generator(
+                self._parse_volume_to_slices_unlabeled, # Correct: uses DataPipeline's method
+                args=(img_p,),
                 output_signature=tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32)
             ),
-            cycle_length=4,
-            num_parallel_calls=AUTOTUNE,
-            deterministic=not is_training
+            cycle_length=AUTOTUNE, num_parallel_calls=AUTOTUNE, deterministic=not is_training
         )
-        
-        # dataset = dataset.filter(lambda img: tf.shape(img)[0] > 0) # Filter based on height of slice
+        dataset = dataset.filter(lambda img: tf.shape(img)[0] == self.config.img_size_y) # Filter out empty/failed loads
+
+        # For MixMatch, the train_step expects a batch of "raw" (or weakly augmented at most) unlabeled images.
+        # The K-augmentations for teacher and the strong augmentation for student consistency happen INSIDE the train_step.
+        # So, here we just ensure the output is a tuple (img_slice,) as expected by the trainer's zipping logic.
+        dataset = dataset.map(lambda x: (x,), num_parallel_calls=AUTOTUNE)
 
         if is_training:
-            dataset = dataset.map(self._augment_for_mean_teacher, num_parallel_calls=AUTOTUNE)
-            dataset = dataset.shuffle(buffer_size=1000)
+            dataset = dataset.shuffle(buffer_size=1024) # Shuffle individual slices
 
-        dataset = dataset.batch(batch_size)
+        dataset = dataset.batch(batch_size, drop_remainder=is_training)
         dataset = dataset.prefetch(buffer_size=AUTOTUNE)
+        # tf.print(f"DEBUG: build_unlabeled_dataset_for_mixmatch, element_spec: {dataset.element_spec}", output_stream=sys.stderr)
         return dataset
 
     def build_validation_dataset(self, image_paths, label_paths, batch_size):
         if not image_paths or not label_paths:
-            tf.print("WARNING: build_validation_dataset received empty image_paths or label_paths.", output_stream=sys.stderr)
-            return tf.data.Dataset.from_tensor_slices(([], [])).batch(batch_size)
+            # tf.print("WARNING DP.build_validation_dataset: empty image_paths or label_paths.", output_stream=sys.stderr)
+            return tf.data.Dataset.from_tensor_slices((
+                tf.zeros([0, self.config.img_size_y, self.config.img_size_x, self.config.num_channels]),
+                tf.zeros([0, self.config.img_size_y, self.config.img_size_x, 1])
+            )).batch(batch_size)
 
         dataset = tf.data.Dataset.from_tensor_slices((image_paths, label_paths))
-        
         dataset = dataset.interleave(
-            lambda img_path_tensor, lbl_path_tensor: tf.data.Dataset.from_generator(
-                self._parse_volume_to_slices_supervised, # Uses supervised parser (no augmentation by default)
-                args=(img_path_tensor, lbl_path_tensor),
+            lambda img_p, lbl_p: tf.data.Dataset.from_generator(
+                self._parse_volume_to_slices_supervised, # Correct
+                args=(img_p, lbl_p),
                 output_signature=(
                     tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, self.config.num_channels), dtype=tf.float32),
                     tf.TensorSpec(shape=(self.config.img_size_y, self.config.img_size_x, 1), dtype=tf.float32)
                 )
             ),
-            cycle_length=4,
-            num_parallel_calls=AUTOTUNE,
-            deterministic=True
+            cycle_length=AUTOTUNE, num_parallel_calls=AUTOTUNE, deterministic=True
         )
-        # dataset = dataset.filter(lambda img, lbl: tf.shape(img)[0] > 0)
+        dataset = dataset.filter(lambda img, lbl: tf.shape(img)[0] == self.config.img_size_y and tf.shape(lbl)[0] == self.config.img_size_y)
 
-        dataset = dataset.batch(batch_size)
+        dataset = dataset.batch(batch_size) # No drop_remainder for validation
         dataset = dataset.prefetch(buffer_size=AUTOTUNE)
         return dataset

@@ -24,11 +24,11 @@ OUTPUT_DIR_ROOT="$WORK_DIR/MT_Experiments_Pretrain_PhasedEMA"
 # Experiment specific parameters
 NUM_LABELED=30                  # Number of labeled patient volumes for training (passed as --num_labeled)
 STUDENT_PRETRAIN_EPOCHS=15      # Epochs for supervised student pre-training
-MT_PHASE_EPOCHS=100             # Epochs for the Mean Teacher phase itself
+MT_PHASE_EPOCHS=150             # Epochs for the Mean Teacher phase itself
 
 # Teacher EMA configuration (for Phased EMA in MT phase)
 TEACHER_EMA_WARMUP_EPOCHS=10    # Initial MT epochs with faster EMA
-INITIAL_TEACHER_EMA_DECAY=0.95  # EMA decay during teacher warmup
+INITIAL_TEACHER_EMA_DECAY=0.5  # EMA decay during teacher warmup
 BASE_EMA_DECAY=0.999            # EMA decay after teacher warmup (passed as --ema_decay)
 
 # Construct a descriptive experiment name
@@ -41,9 +41,11 @@ NUM_VALIDATION=10
 BATCH_SIZE=4
 LEARNING_RATE=1e-4
 CONSISTENCY_MAX=10.0             # <<< CORRECTED: Set to a non-zero value
-CONSISTENCY_RAMPUP=30            # Epochs for consistency weight ramp-up (during MT_PHASE_EPOCHS)
+CONSISTENCY_RAMPUP=30    
+SHARPENING_TEMPERATURE=0.5        # Epochs for consistency weight ramp-up (during MT_PHASE_EPOCHS)
 EARLY_STOPPING_PATIENCE=25       # Increased patience slightly for MT phase
 SEED=42
+DROPOUT_RATE=0.1
 VERBOSE=1
 
 # --- SLURM Preamble ---

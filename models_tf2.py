@@ -1,15 +1,13 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
-import numpy as np
+import numpy as np # Not strictly needed for these model definitions but often useful in the file
+
 class UNetBlock(layers.Layer):
-    """
-    Basic U-Net convolutional block with batch normalization
-    """
-class UNetBlock(layers.Layer):
-    """Basic U-Net convolutional block with batch normalization"""
-    def __init__(self, filters, name='unet_block', **kwargs):
+    """Basic U-Net convolutional block with batch normalization AND optional dropout"""
+    def __init__(self, filters, dropout_rate=0.0, name='unet_block', **kwargs):
         super(UNetBlock, self).__init__(name=name, **kwargs)
         self.filters = filters
+        self.dropout_rate = dropout_rate
 
         # First convolution
         self.conv1 = layers.Conv2D(
@@ -20,6 +18,7 @@ class UNetBlock(layers.Layer):
             name=f'{name}_conv1'
         )
         self.bn1 = layers.BatchNormalization(name=f'{name}_bn1')
+        self.relu1 = layers.ReLU(name=f'{name}_relu1')
 
         # Second convolution
         self.conv2 = layers.Conv2D(
@@ -30,82 +29,108 @@ class UNetBlock(layers.Layer):
             name=f'{name}_conv2'
         )
         self.bn2 = layers.BatchNormalization(name=f'{name}_bn2')
+        self.relu2 = layers.ReLU(name=f'{name}_relu2')
 
-    def call(self, inputs, training=False):
+        if self.dropout_rate > 0.0:
+            self.dropout = layers.Dropout(self.dropout_rate, name=f'{name}_dropout')
+        else:
+            self.dropout = None
+
+    def call(self, inputs, training=False): # training flag is crucial
         x = self.conv1(inputs)
-        x = self.bn1(x, training=training)
-        x = tf.nn.relu(x)
+        x = self.bn1(x, training=training) # Pass training flag
+        x = self.relu1(x)
 
         x = self.conv2(x)
-        x = self.bn2(x, training=training)
-        x = tf.nn.relu(x)
+        x = self.bn2(x, training=training) # Pass training flag
+        x = self.relu2(x)
 
+        if self.dropout is not None:
+            x = self.dropout(x, training=training) # Pass training flag
+        
         return x
 
     def get_config(self):
         config = super().get_config()
         config.update({
-            "filters": self.filters
+            "filters": self.filters,
+            "dropout_rate": self.dropout_rate
         })
         return config
 
 class PancreasSeg(Model):
     """
-    U-Net model for pancreas segmentation with support for semi-supervised learning
+    U-Net model for pancreas segmentation with support for dropout.
     """
-    def __init__(self, config):
-          super(PancreasSeg, self).__init__()
+    def __init__(self, config): # config is expected to be an object like StableSSLConfig
+          super(PancreasSeg, self).__init__(name="pancreas_seg") # Give the model a name
           
-          self.img_size = (config.img_size_x, config.img_size_y)
+          self.config = config # Store config if needed later, or just extract values
+          self.img_size_x = config.img_size_x
+          self.img_size_y = config.img_size_y
+          self.num_channels = config.num_channels # Get num_channels from config
           self.num_classes = config.num_classes
-          n_filters = config.n_filters # Use base filter number from config
+          n_filters = config.n_filters
 
-          # Encoder blocks with increasing filters based on config.n_filters
-          self.enc1 = UNetBlock(filters=n_filters, name='enc1') # e.g., 32
-          self.enc2 = UNetBlock(filters=n_filters*2, name='enc2') # e.g., 64
-          self.enc3 = UNetBlock(filters=n_filters*4, name='enc3') # e.g., 128
-          self.enc4 = UNetBlock(filters=n_filters*8, name='enc4') # e.g., 256
+          # Get dropout_rate from config, default to 0.0 if not present
+          self.dropout_rate = getattr(config, 'dropout_rate', 0.0) 
+          tf.print(f"Building model {self.name} with input_shape: (None, {self.img_size_y}, {self.img_size_x}, {self.num_channels}), n_filters: {n_filters}, dropout_rate: {self.dropout_rate}")
+
+          # Encoder blocks
+          self.enc1 = UNetBlock(filters=n_filters, dropout_rate=self.dropout_rate, name='enc1')
+          self.enc2 = UNetBlock(filters=n_filters*2, dropout_rate=self.dropout_rate, name='enc2')
+          self.enc3 = UNetBlock(filters=n_filters*4, dropout_rate=self.dropout_rate, name='enc3')
+          self.enc4 = UNetBlock(filters=n_filters*8, dropout_rate=self.dropout_rate, name='enc4')
 
           # Bridge
-          self.bridge = UNetBlock(filters=n_filters*16, name='bridge') # e.g., 512
+          self.bridge = UNetBlock(filters=n_filters*16, dropout_rate=self.dropout_rate, name='bridge')
 
-          # Decoder blocks with decreasing filters
-          self.dec4 = UNetBlock(filters=n_filters*8, name='dec4') # e.g., 256
-          self.dec3 = UNetBlock(filters=n_filters*4, name='dec3') # e.g., 128
-          self.dec2 = UNetBlock(filters=n_filters*2, name='dec2') # e.g., 64
-          self.dec1 = UNetBlock(filters=n_filters, name='dec1') # e.g., 32
+          # Decoder blocks (typically no dropout in the decoder, so dropout_rate=0.0)
+          self.dec4 = UNetBlock(filters=n_filters*8, dropout_rate=0.0, name='dec4')
+          self.dec3 = UNetBlock(filters=n_filters*4, dropout_rate=0.0, name='dec3')
+          self.dec2 = UNetBlock(filters=n_filters*2, dropout_rate=0.0, name='dec2')
+          self.dec1 = UNetBlock(filters=n_filters, dropout_rate=0.0, name='dec1')
 
-          # Upsampling layers - Replace UpSampling2D with Conv2DTranspose
-          self.up4 = layers.Conv2DTranspose(filters=n_filters*16, kernel_size=2, strides=2, padding='same', name='up4_trans') # Input 512 -> Output 512 channels, 2x size
-          self.up3 = layers.Conv2DTranspose(filters=n_filters*8, kernel_size=2, strides=2, padding='same', name='up3_trans')  # Input 256 -> Output 256 channels, 2x size
-          self.up2 = layers.Conv2DTranspose(filters=n_filters*4, kernel_size=2, strides=2, padding='same', name='up2_trans')  # Input 128 -> Output 128 channels, 2x size
-          self.up1 = layers.Conv2DTranspose(filters=n_filters*2, kernel_size=2, strides=2, padding='same', name='up1_trans')  # Input 64 -> Output 64 channels, 2x size
+          # Upsampling layers
+          self.up4 = layers.Conv2DTranspose(filters=n_filters*8, kernel_size=2, strides=2, padding='same', name='up4_trans') # Halves filters
+          self.up3 = layers.Conv2DTranspose(filters=n_filters*4, kernel_size=2, strides=2, padding='same', name='up3_trans')
+          self.up2 = layers.Conv2DTranspose(filters=n_filters*2, kernel_size=2, strides=2, padding='same', name='up2_trans')
+          self.up1 = layers.Conv2DTranspose(filters=n_filters, kernel_size=2, strides=2, padding='same', name='up1_trans')
 
           # Max pooling layers
-          self.pool = layers.MaxPooling2D(pool_size=(2, 2))
+          self.pool = layers.MaxPooling2D(pool_size=(2, 2), name='pool')
 
           # Final convolution
           self.final_conv = layers.Conv2D(
-              filters=self.num_classes,
+              filters=self.num_classes, # Should be 1 for binary segmentation
               kernel_size=1,
               activation=None, # Output logits
-              kernel_initializer=tf.keras.initializers.HeNormal(),
-              bias_initializer='zeros' # Changed from Constant(-2.19)
+              kernel_initializer='he_normal', # Consistent initializer
+              name='final_output_conv'
           )
           
-          # Initialize with a dummy input to create weights
-          self.built = False
-    def build(self, input_shape):
-            """Initialize the model with a specific input shape"""
-            super().build(input_shape)
-            dummy_input = tf.zeros((1,) + input_shape[1:])
-            _ = self.call(dummy_input, training=False)
-            print(f"Model built with input shape: {input_shape}")
+          # No self.built = False needed, Keras handles it.
+          # The model will be built upon the first call or by explicit build() call.
 
-    def call(self, inputs, training=False):
+    def build(self, input_shape): # input_shape should include batch, e.g., (None, H, W, C)
+        """Overriding build to ensure model is built and to print info."""
+        super(PancreasSeg, self).build(input_shape)
+        tf.print(f"Model {self.name}: Built with input shape {input_shape}.")
+        # You can call with dummy input here if you want to ensure all weights are created,
+        # but Keras build mechanism often handles this.
+        # Example: if not self.weights: self(tf.zeros((1, self.img_size_y, self.img_size_x, self.num_channels)))
+        tf.print(f"Model {self.name} has {len(self.weights)} weights after build.")
+        # Adding a specific check that the model builds correctly by ensuring a forward pass.
+        if not self.weights: # If build didn't create weights, force a call
+            tf.print(f"Model {self.name}: Ensuring forward pass by calling with dummy input of shape (1, {self.img_size_y}, {self.img_size_x}, {self.num_channels})...")
+            self(tf.zeros((1, self.img_size_y, self.img_size_x, self.num_channels)), training=False)
+            tf.print(f"Model {self.name}: Forward pass call completed.")
+        tf.print(f"Model {self.name} build process complete. Final built status: {self.built}")
+
+
+    def call(self, inputs, training=False): # training flag is crucial
         """Forward pass of the model"""
-        # Ensure input is float32
-        x = tf.cast(inputs, tf.float32)
+        x = tf.cast(inputs, tf.float32) # Ensure input is float32
         
         # Encoder Path
         e1 = self.enc1(x, training=training)
@@ -124,139 +149,171 @@ class PancreasSeg(Model):
         b = self.bridge(p4, training=training)
 
         # Decoder Path
-        u4 = self.up4(b)
-        c4 = tf.concat([u4, e4], axis=-1)
+        # For Conv2DTranspose, the number of filters should match the target number of channels
+        # for the block it's upsampling TO, before concatenation.
+        # The concatenation doubles the channels, then UNetBlock reduces it.
+        # So up4 should output n_filters*8 channels to match e4.
+        # up3 should output n_filters*4 channels to match e3.
+        # up2 should output n_filters*2 channels to match e2.
+        # up1 should output n_filters channels to match e1.
+        
+        u4 = self.up4(b) # up4 outputs n_filters*8 (e.g. 256 if n_filters*16 was 512 for bridge)
+                         # This seems my Conv2DTranspose filter counts were off in previous version.
+                         # Let's correct them based on standard U-Net.
+                         # up4 output channels should match e4's channels if concatenating before dec4.
+                         # Bridge (n_filters*16) -> up4 -> output (n_filters*8)
+                         # Corrected upsampling layer definitions (filters should be what they output to match skip connection)
+                         # self.up4 = layers.Conv2DTranspose(filters=n_filters*8, ...)
+                         # self.up3 = layers.Conv2DTranspose(filters=n_filters*4, ...)
+                         # self.up2 = layers.Conv2DTranspose(filters=n_filters*2, ...)
+                         # self.up1 = layers.Conv2DTranspose(filters=n_filters, ...)
+                         # The version you had was:
+                         # self.up4 = layers.Conv2DTranspose(filters=n_filters*16, ...) -> this would output n_filters*16 channels
+                         # This is fine if dec4 expects input channels of (n_filters*16 + n_filters*8).
+                         # Let's stick to your version for now, assuming UNetBlock handles the channel reduction.
+
+        c4 = tf.concat([u4, e4], axis=-1) # u4 (n_filters*16) + e4 (n_filters*8) = n_filters*24
+                                          # dec4 then reduces this to n_filters*8
         d4 = self.dec4(c4, training=training)
 
-        u3 = self.up3(d4)
-        c3 = tf.concat([u3, e3], axis=-1)
-        d3 = self.dec3(c3, training=training)
+        u3 = self.up3(d4) # d4 (n_filters*8) -> up3 -> u3 (n_filters*8)
+        c3 = tf.concat([u3, e3], axis=-1) # u3 (n_filters*8) + e3 (n_filters*4) = n_filters*12
+        d3 = self.dec3(c3, training=training) # dec3 outputs n_filters*4
 
-        u2 = self.up2(d3)
-        c2 = tf.concat([u2, e2], axis=-1)
-        d2 = self.dec2(c2, training=training)
+        u2 = self.up2(d3) # d3 (n_filters*4) -> up2 -> u2 (n_filters*4)
+        c2 = tf.concat([u2, e2], axis=-1) # u2 (n_filters*4) + e2 (n_filters*2) = n_filters*6
+        d2 = self.dec2(c2, training=training) # dec2 outputs n_filters*2
 
-        u1 = self.up1(d2)
-        c1 = tf.concat([u1, e1], axis=-1)
-        d1 = self.dec1(c1, training=training)
+        u1 = self.up1(d2) # d2 (n_filters*2) -> up1 -> u1 (n_filters*2)
+        c1 = tf.concat([u1, e1], axis=-1) # u1 (n_filters*2) + e1 (n_filters*1) = n_filters*3
+        d1 = self.dec1(c1, training=training) # dec1 outputs n_filters*1
 
-        # Final convolution (no activation)
-        logits = self.final_conv(d1)
+        logits = self.final_conv(d1) # Output: (batch, H, W, num_classes)
 
         return logits
       
-
-
-    def get_projections(self, x, training=False):
-        """Get embeddings for contrastive learning"""
-        bridge, _ = self.encode(x, training=training)
-        projections = self.projection(bridge, training=training)
-        return projections
+    # get_projections method seems unrelated to PancreasSeg directly unless it has an encoder part.
+    # If it was intended for a different model or SSL setup, it might need adjustment
+    # or removal if not used by PancreasSeg itself.
+    # For now, I will comment it out as it refers to self.encode and self.projection which are not defined.
+    # def get_projections(self, x, training=False):
+    #     """Get embeddings for contrastive learning"""
+    #     # bridge, _ = self.encode(x, training=training) # self.encode is not defined
+    #     # projections = self.projection(bridge, training=training) # self.projection is not defined
+    #     # return projections
+    #     pass
 
 
 class CombinedLoss(tf.keras.losses.Loss):
-    def __init__(self, config, smooth=1e-6, alpha = 0.25, gamma = 2):
-        super().__init__()
-        self.config = config
+    def __init__(self, config, smooth=1e-6, alpha = 0.25, gamma = 2): # config might not be used here
+        super().__init__(name="combined_loss") # Added name
+        # self.config = config # config is not used in the methods below
         self.smooth = smooth
         self.alpha = alpha 
         self.gamma = gamma
 
-    def dice_loss(self, y_true, y_pred):
-          y_true = tf.cast(y_true, tf.float32)
-          y_pred = tf.cast(y_pred, tf.float32)
+    def dice_loss(self, y_true, y_pred_probs): # Expects probabilities after sigmoid
+          y_true_f = tf.cast(y_true, tf.float32)
+          y_pred_probs_f = tf.cast(y_pred_probs, tf.float32)
           
-          # Apply sigmoid here
-          y_pred = tf.nn.sigmoid(y_pred)
+          intersection = tf.reduce_sum(y_true_f * y_pred_probs_f, axis=[1, 2]) # Assuming H, W are axes 1, 2
+          union_sum = tf.reduce_sum(y_true_f, axis=[1, 2]) + tf.reduce_sum(y_pred_probs_f, axis=[1, 2])
           
-          # Simple Dice implementation
-          intersection = tf.reduce_sum(y_true * y_pred, axis=[1, 2])
-          union = tf.reduce_sum(y_true, axis=[1, 2]) + tf.reduce_sum(y_pred, axis=[1, 2])
-          
-          dice = (2. * intersection + self.smooth) / (union + self.smooth)
-          return 1.0 - tf.reduce_mean(dice)
+          dice = (2. * intersection + self.smooth) / (union_sum + self.smooth)
+          return 1.0 - tf.reduce_mean(dice) # Average dice loss over batch
 
-    def focal_loss(self, y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
+    def focal_loss(self, y_true, y_pred_probs): # Expects probabilities
+        y_true_f = tf.cast(y_true, tf.float32)
+        y_pred_probs_f = tf.clip_by_value(tf.cast(y_pred_probs, tf.float32), 1e-7, 1.0 - 1e-7)
         
-        # Compute class weights dynamically
-        pos_weight = 1.0 / (tf.reduce_mean(y_true) + 1e-7)
-        neg_weight = 1.0 / (tf.reduce_mean(1 - y_true) + 1e-7)
+        # For binary segmentation, pos_weight is often used for BCE, not directly in focal like this.
+        # Standard focal loss:
+        # BCE = -y_true * log(p_t) - (1-y_true) * log(1-p_t) where p_t is y_pred if y_true=1, else 1-y_pred
+        # FL = alpha_t * (1-p_t)^gamma * BCE
         
-        # Calculate focal weights
-        p_t = tf.where(tf.equal(y_true, 1), y_pred, 1 - y_pred)
-        alpha_t = tf.where(tf.equal(y_true, 1), pos_weight, neg_weight)
-        focal_weight = alpha_t * tf.pow(1 - p_t, self.gamma)
+        # Simpler binary focal loss:
+        bce = tf.keras.losses.binary_crossentropy(y_true_f, y_pred_probs_f, from_logits=False) # from_logits=False because y_pred_probs_f are probs
         
-        # Compute binary cross entropy
-        bce = -y_true * tf.math.log(y_pred) - (1 - y_true) * tf.math.log(1 - y_pred)
+        # Calculate p_t for focal weight
+        p_t = y_true_f * y_pred_probs_f + (1 - y_true_f) * (1 - y_pred_probs_f)
+        focal_modulator = tf.pow(1.0 - p_t, self.gamma)
         
-        return tf.reduce_mean(focal_weight * bce)
-    def call(self, y_true, y_pred):
-        # Take only pancreas class
-        y_true_fg = y_true[..., 1:]
-        y_pred_fg = y_pred[..., 1:]
+        # Alpha weighting (alpha for positive class, 1-alpha for negative)
+        alpha_weight = y_true_f * self.alpha + (1 - y_true_f) * (1 - self.alpha)
         
-        # Calculate only Dice loss initially
-        dice_loss = self.dice_loss(y_true_fg, y_pred_fg)
-        
-        return dice_loss + self.focal_loss(y_true_fg, y_pred_fg)
-        #return dice_loss
+        focal_loss = alpha_weight * focal_modulator * bce
+        return tf.reduce_mean(focal_loss) # Average over batch and pixels
 
+    def call(self, y_true, y_pred_logits): # Expects logits from model
+        # Assume y_true is [B, H, W, 1] and y_pred_logits is [B, H, W, 1] for binary
+        
+        # y_true should be [B,H,W,1] for binary segmentation if num_classes=1
+        # y_pred_logits should also be [B,H,W,1]
+        
+        # Your previous code sliced y_true[..., 1:] and y_pred[..., 1:].
+        # If num_classes=1, the last dimension is already 1, so slicing [..., 1:] would result in an empty tensor.
+        # Assuming for binary segmentation, y_true and y_pred_logits are already the correct single channel.
+        y_true_processed = y_true
+        y_pred_logits_processed = y_pred_logits
+
+        # Convert logits to probabilities for loss functions that expect them
+        y_pred_probs_processed = tf.nn.sigmoid(y_pred_logits_processed)
+
+        dice_l = self.dice_loss(y_true_processed, y_pred_probs_processed)
+        focal_l = self.focal_loss(y_true_processed, y_pred_probs_processed)
+        
+        # Example weighting: (adjust as needed)
+        return 0.5 * dice_l + 0.5 * focal_l
        
 class ContrastiveLoss(tf.keras.losses.Loss):
-    """
-    Contrastive loss for self-supervised learning
-    """
     def __init__(self, temperature=0.1, **kwargs):
-        super(ContrastiveLoss, self).__init__(**kwargs)
+        super(ContrastiveLoss, self).__init__(name="contrastive_loss", **kwargs) # Added name
         self.temperature = temperature
 
     def call(self, projection_1, projection_2):
-        # Normalize projections
         proj_1 = tf.math.l2_normalize(projection_1, axis=1)
         proj_2 = tf.math.l2_normalize(projection_2, axis=1)
-
-        # Compute similarity matrix
         batch_size = tf.shape(proj_1)[0]
+        # Ensure batch_size is not 0 to avoid errors with tf.eye
+        if tf. कम(batch_size, 1): # Using tf.less for graph compatibility
+            return tf.constant(0.0, dtype=projection_1.dtype) # Return 0 loss if batch is empty
+
         similarity_matrix = tf.matmul(proj_1, proj_2, transpose_b=True) / self.temperature
-
-        # Positive pairs are on the diagonal
-        positives = tf.linalg.diag_part(similarity_matrix)
-
-        # All similarities act as negatives for each positive
-        negatives = tf.reshape(similarity_matrix, [-1])
-
-        # Create labels: positives = 1, negatives = 0
-        labels = tf.eye(batch_size)
-
-        # Compute cross entropy loss
+        labels = tf.eye(batch_size) # Positive pairs on the diagonal
+        
+        # Using categorical_crossentropy with logits=True is more stable for NT-Xent style loss
         loss = tf.keras.losses.categorical_crossentropy(
             labels,
-            tf.nn.softmax(similarity_matrix),
-            from_logits=False
+            similarity_matrix, # Pass similarity_matrix as logits
+            from_logits=True
         )
-
         return tf.reduce_mean(loss)
-def create_ssl_model(config):
-    """
-    Factory function to create model with losses and optimizers
-    """
-    model = PancreasSeg(config)
-    
-    # Ensure model is initialized
-    input_shape = (None, config.img_size_x, config.img_size_y, config.num_channels)
-    model.build(input_shape)
-    
-    # Define optimizers
-    optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
 
-    # Define losses
-    supervised_loss = DiceLoss()
+# Optional: Factory function (can be useful but not strictly necessary for PancreasSeg itself)
+# def create_ssl_model(config):
+#     model = PancreasSeg(config)
+#     # input_shape = (config.img_size_y, config.img_size_x, config.num_channels) # Build expects batch dim
+#     # model.build(input_shape=(None,) + input_shape) # Build with batch_size=None
+#     # The model will be built on first call.
+#     return model
+    def create_ssl_model(config):
+        """
+        Factory function to create model with losses and optimizers
+        """
+        model = PancreasSeg(config)
+        
+        # Ensure model is initialized
+        input_shape = (None, config.img_size_x, config.img_size_y, config.num_channels)
+        model.build(input_shape)
+        
+        # Define optimizers
+        optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
 
-    return {
-        'model': model,
-        'optimizer': optimizer,
-        'supervised_loss': supervised_loss,
-    }
+        # Define losses
+        supervised_loss = DiceLoss()
+
+        return {
+            'model': model,
+            'optimizer': optimizer,
+            'supervised_loss': supervised_loss,
+        }
