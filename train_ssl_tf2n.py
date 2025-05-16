@@ -736,90 +736,177 @@ class StableSSLTrainer:
 # Add MeanTeacherTrainer class definition here
 
 class MeanTeacherTrainer(tf.keras.Model):
-    def __init__(self, student_model, teacher_model, ema_decay, **kwargs):
+    def __init__(self, student_model, teacher_model, ema_decay,  teacher_ema_warmup_epochs=0,  initial_teacher_ema_decay=0.95, **kwargs):
         super().__init__(**kwargs)
         self.student_model = student_model
         self.teacher_model = teacher_model
-        self.ema_decay = ema_decay
+        self.base_ema_decay = ema_decay
         
+        self.teacher_ema_warmup_epochs = teacher_ema_warmup_epochs
+        self.initial_teacher_ema_decay = initial_teacher_ema_decay
         # Ensure teacher model is not trainable by the optimizer
         self.teacher_model.trainable = False
 
         self.consistency_weight = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="consistency_weight")
         self.consistency_loss_fn = tf.keras.losses.MeanSquaredError()
 
+        # To track the current epoch within the Mean Teacher training phase
+        self.mt_phase_current_epoch = tf.Variable(-1, dtype=tf.int32, trainable=False, name="mt_phase_epoch_counter")
+
     def _update_teacher_model(self):
+        # self.mt_phase_current_epoch should be updated by a callback
+        current_epoch = self.mt_phase_current_epoch 
+        
+        effective_ema_decay = self.base_ema_decay
+        if self.teacher_ema_warmup_epochs > 0 and current_epoch < self.teacher_ema_warmup_epochs and current_epoch != -1 : # current_epoch != -1 ensures it's been set
+            effective_ema_decay = self.initial_teacher_ema_decay
+            # Optional: tf.print for debugging the EMA decay being used
+            # tf.print(f"EMA Update: MT Epoch {current_epoch + 1}, using WARMUP EMA decay: {effective_ema_decay}", output_stream=sys.stderr)
+        # else:
+            # tf.print(f"EMA Update: MT Epoch {current_epoch + 1}, using BASE EMA decay: {effective_ema_decay}", output_stream=sys.stderr)
+
+
         for student_var, teacher_var in zip(self.student_model.trainable_variables, self.teacher_model.trainable_variables):
             teacher_var.assign(self.ema_decay * teacher_var + (1.0 - self.ema_decay) * student_var)
 
-    def _calculate_dice(self, y_true, y_pred_logits, smooth=1e-6):
-        y_true_f = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
-        # Apply sigmoid to logits before binarization
-        y_pred_probs = tf.nn.sigmoid(y_pred_logits)
-        y_pred_f_binary = tf.cast(tf.reshape(y_pred_probs > 0.5, [-1]), tf.float32)
+# In train_ssl_tf2n.py
 
-        intersection = tf.reduce_sum(y_true_f * y_pred_f_binary)
-        dice_score = (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f_binary) + smooth)
-        return dice_score
+class MeanTeacherTrainer(tf.keras.Model):
+    def __init__(self, student_model, teacher_model, ema_decay,
+                 # Parameters for Phased EMA
+                 teacher_warmup_epochs=0, 
+                 initial_teacher_ema_decay=0.95, 
+                 **kwargs): # Keep **kwargs for other tf.keras.Model arguments
+        super().__init__(**kwargs) # Pass **kwargs to the parent constructor
+        self.student_model = student_model
+        self.teacher_model = teacher_model
+        
+        self.base_ema_decay = ema_decay # This is the target high decay (e.g., 0.999) after warmup
+        self.teacher_ema_warmup_epochs = teacher_warmup_epochs # Epochs in MT phase for faster teacher updates
+        self.initial_teacher_ema_decay = initial_teacher_ema_decay # EMA decay during these teacher_ema_warmup_epochs
+        
+        self.teacher_model.trainable = False # Teacher is not trained by optimizer
+
+        self.consistency_weight = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="consistency_weight")
+        self.consistency_loss_fn = tf.keras.losses.MeanSquaredError() # Standard MSE for prob difference
+        
+        # To track the current epoch within the Mean Teacher training phase (updated by a callback)
+        self.mt_phase_current_epoch = tf.Variable(-1, dtype=tf.int32, trainable=False, name="mt_phase_epoch_counter")
+
+    def _update_teacher_model(self):
+        current_epoch_mt_phase = self.mt_phase_current_epoch # This is a tf.Variable (int32)
+        
+        # --- Convert Python ints/floats to TF Tensors for comparison if not already ---
+        # self.teacher_ema_warmup_epochs is a Python int from __init__
+        # self.initial_teacher_ema_decay is a Python float
+        # self.base_ema_decay is a Python float
+        
+        # Condition for using initial_teacher_ema_decay
+        # All parts of the condition must result in TF boolean tensors
+        cond1 = tf.greater(tf.cast(self.teacher_ema_warmup_epochs, tf.int32), 0) # True if teacher_ema_warmup_epochs > 0
+        cond2 = tf.less(current_epoch_mt_phase, tf.cast(self.teacher_ema_warmup_epochs, tf.int32)) # True if current_epoch < teacher_ema_warmup_epochs
+        cond3 = tf.not_equal(current_epoch_mt_phase, tf.constant(-1, dtype=tf.int32)) # True if current_epoch has been set
+
+        # Combine conditions using tf.logical_and
+        is_in_teacher_warmup_phase = tf.logical_and(cond1, tf.logical_and(cond2, cond3))
+
+        # Use tf.cond to select the effective_ema_decay
+        effective_ema_decay = tf.cond(
+            is_in_teacher_warmup_phase,
+            lambda: tf.cast(self.initial_teacher_ema_decay, tf.float32), # True branch
+            lambda: tf.cast(self.base_ema_decay, tf.float32)             # False branch
+        )
+        
+        # Optional: tf.print for debugging the EMA decay being used (conditionally)
+        # This print will execute based on the TF graph's control flow.
+        # def print_warmup():
+        #     tf.print(f"EMA Update: MT Epoch {current_epoch_mt_phase + 1}, using WARMUP EMA: {effective_ema_decay}", output_stream=sys.stderr)
+        #     return tf.constant(True) # Dummy return for tf.cond
+        # def print_base():
+        #     tf.print(f"EMA Update: MT Epoch {current_epoch_mt_phase + 1}, using BASE EMA: {effective_ema_decay}", output_stream=sys.stderr)
+        #     return tf.constant(True)
+        # _ = tf.cond(is_in_teacher_warmup_phase, print_warmup, print_base)
+
+
+        for student_var, teacher_var in zip(self.student_model.trainable_variables, self.teacher_model.trainable_variables):
+            # Ensure dtypes match if necessary, though assign usually handles it
+            # student_val_casted = tf.cast(student_var, teacher_var.dtype)
+            # teacher_var.assign(effective_ema_decay * teacher_var + (1.0 - effective_ema_decay) * student_val_casted)
+            teacher_var.assign(effective_ema_decay * teacher_var + (1.0 - effective_ema_decay) * student_var)
+
+    def _calculate_dice(self, y_true, y_pred_logits, smooth=1e-6):
+        # y_true shape: (batch, H, W, 1)
+        # y_pred_logits shape: (batch, H, W, 1)
+        y_true_f = tf.cast(y_true, tf.float32)
+        y_pred_probs = tf.nn.sigmoid(y_pred_logits) # Convert logits to probabilities
+        y_pred_f_binary = tf.cast(y_pred_probs > 0.5, tf.float32) # Binarize predictions
+
+        # Calculate Dice per sample in the batch then average
+        intersection = tf.reduce_sum(y_true_f * y_pred_f_binary, axis=[1, 2, 3]) # Sum over H, W, C (Channel is 1)
+        sum_true = tf.reduce_sum(y_true_f, axis=[1, 2, 3])
+        sum_pred = tf.reduce_sum(y_pred_f_binary, axis=[1, 2, 3])
+        
+        dice_per_sample = (2. * intersection + smooth) / (sum_true + sum_pred + smooth)
+        
+        return tf.reduce_mean(dice_per_sample) # Average Dice across the batch
 
     def compile(self, optimizer, supervised_loss_fn, metrics=None, **kwargs):
         super().compile(optimizer=optimizer, loss=supervised_loss_fn, metrics=metrics, **kwargs)
-        # self.supervised_loss_fn is now self.compiled_loss
-        # self.student_metrics are now self.compiled_metrics
+        # self.compiled_loss refers to supervised_loss_fn
+        # self.compiled_metrics refers to metrics
 
     @property
     def metrics(self):
-        # We need to list all metrics, including the ones from compile and custom ones for train/test_step
-        # Start with metrics passed to compile (e.g., student_dice)
-        metrics = super().metrics
-        # If you have other custom metrics you want to track but aren't added in compile, add them here.
-        # For now, compiled_metrics should cover student_dice. Teacher_dice is handled in test_step directly.
-        return metrics
+        # This ensures Keras tracks metrics correctly.
+        # It starts with metrics passed to compile (like student_dice).
+        # If you had metrics you only wanted to update in train_step but not display, you'd manage them differently.
+        return super().metrics 
 
-    # In class MeanTeacherTrainer(tf.keras.Model):
     def train_step(self, data):
         labeled_data, unlabeled_data = data
         labeled_images, true_labels = labeled_data
-        unlabeled_student_input, unlabeled_teacher_input = unlabeled_data
+        unlabeled_student_input, unlabeled_teacher_input = unlabeled_data # These are (student_aug, teacher_aug)
 
         with tf.GradientTape() as tape:
             # Supervised loss on labeled data
             student_labeled_logits = self.student_model(labeled_images, training=True)
-            # Add regularization_losses if your student_model has any (e.g. from Dense layers with kernel_regularizer)
-            # If not, self.student_model.losses will be an empty list.
-            supervised_loss = self.compiled_loss(true_labels, student_labeled_logits, regularization_losses=self.student_model.losses)
-
+            supervised_loss = self.compiled_loss(
+                true_labels, 
+                student_labeled_logits, 
+                regularization_losses=self.student_model.losses # Include model's internal regularization losses
+            )
 
             # Consistency loss on unlabeled data
             student_unlabeled_logits = self.student_model(unlabeled_student_input, training=True)
             teacher_unlabeled_logits = self.teacher_model(unlabeled_teacher_input, training=False) # Teacher not in training mode
 
             student_unlabeled_probs = tf.nn.sigmoid(student_unlabeled_logits)
-            teacher_unlabeled_probs = tf.nn.sigmoid(teacher_unlabeled_logits)
+            teacher_unlabeled_probs = tf.nn.sigmoid(teacher_unlabeled_logits) # Teacher output also needs sigmoid
             
             consistency_loss_value = self.consistency_loss_fn(teacher_unlabeled_probs, student_unlabeled_probs)
             
+            # Total loss calculation
             total_loss = supervised_loss + self.consistency_weight * consistency_loss_value
 
         # Compute gradients for student model
         gradients = tape.gradient(total_loss, self.student_model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.student_model.trainable_variables))
 
-        # Update teacher model using EMA
+        # Update teacher model using EMA (uses self.mt_phase_current_epoch)
         self._update_teacher_model()
 
-        # Update compiled metrics (this includes 'student_dice' Keras metric object)
+        # Update compiled Keras metrics (e.g., student_dice on labeled data)
         self.compiled_metrics.update_state(true_labels, student_labeled_logits)
 
-        # Prepare logs: return TENSORS. Keras will handle them.
+        # Prepare logs to be returned: these must be TENSOR objects
         logs = {
-            'loss': total_loss, # This is a tensor
-            'supervised_loss': supervised_loss, # This is a tensor
-            'consistency_loss': consistency_loss_value # This is a tensor
+            'loss': total_loss, 
+            'supervised_loss': supervised_loss, 
+            'consistency_loss': consistency_loss_value
         }
-        # Add results from compiled metrics (e.g., student_dice)
-        for metric in self.metrics: # self.metrics already includes metrics from compile()
-            logs[metric.name] = metric.result() # metric.result() is a tensor
+        # Add results from compiled metrics (e.g., student_dice.result())
+        for metric in self.metrics: # self.metrics includes metrics passed to compile()
+            logs[metric.name] = metric.result()
         
         return logs
 
@@ -828,30 +915,41 @@ class MeanTeacherTrainer(tf.keras.Model):
 
         # Student model evaluation
         student_val_logits = self.student_model(val_images, training=False)
-        val_supervised_loss = self.compiled_loss(val_labels, student_val_logits) # Student's supervised loss
+        # Calculate student's supervised loss on validation data
+        val_student_loss = self.compiled_loss(val_labels, student_val_logits, regularization_losses=self.student_model.losses)
 
-        # Calculate dice scores manually
-        student_dice = self._calculate_dice(val_labels, student_val_logits)
-        
-        # Update metrics
+        # Update compiled Keras metrics for the student on validation data
         self.compiled_metrics.update_state(val_labels, student_val_logits)
 
         # Teacher model evaluation
         teacher_val_logits = self.teacher_model(val_images, training=False)
-        teacher_dice_score = self._calculate_dice(val_labels, teacher_val_logits)
+        # Calculate teacher's Dice score manually for logging
+        teacher_dice_score = self._calculate_dice(val_labels, teacher_val_logits) 
 
-        # Prepare logs
+        # Prepare logs to be returned
         logs = {
-            'loss': val_supervised_loss,
-            'student_dice': student_dice,
-            'teacher_dice': teacher_dice_score
+            'loss': val_student_loss, # Overall validation loss is student's supervised loss
+            'teacher_dice': teacher_dice_score # Log teacher's dice score
         }
-        
-        # Add metrics from the compiled_metrics
+        # Add results from compiled metrics (this will include val_student_dice)
         for metric in self.metrics:
-            logs[metric.name] = metric.result()
-        
-        return logs
+            logs[f"val_{metric.name}"] = metric.result() # Keras automatically prefixes 'val_'
+                                                         # but for compiled_metrics, result() here gives current state.
+                                                         # Let's rely on Keras to name them correctly.
+                                                         # The metric.name for DiceCoefficient is 'student_dice'.
+                                                         # Keras will log it as 'val_student_dice'.
+            # We can just add the compiled metrics directly; Keras handles val_ prefix.
+            logs[metric.name] = metric.result() 
+
+        # To be absolutely clear for logging:
+        # Keras will take the 'loss' from here and log it as 'val_loss'.
+        # It will take 'student_dice' from compiled_metrics.result() and log it as 'val_student_dice'.
+        # So, we just need to add 'teacher_dice'.
+        final_logs = {'loss': val_student_loss, 'teacher_dice': teacher_dice_score}
+        for metric in self.metrics: # This gets the updated state for 'student_dice'
+            final_logs[metric.name] = metric.result()
+            
+        return final_logs
 
 class StableConsistencyLoss(tf.keras.losses.Loss):
     """Stable Consistency Loss with temperature scaling"""

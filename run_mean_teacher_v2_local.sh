@@ -1,128 +1,101 @@
 #!/bin/bash
-# SLURM batch job script for Mean Teacher v2 semi-supervised learning
+# SLURM batch job script for Mean Teacher v2 (with Student Pre-training & Phased EMA)
 
 #SBATCH -p gpu
-#SBATCH --gres=gpu:2                # Request 2 GPUs (adjust if needed, e.g., gpu:1 for single GPU)
-#SBATCH -n 8                        # Request 8 CPU cores (good for data loading)
-#SBATCH --mem=64G                   # Request 64GB RAM
-#SBATCH --time=02:00:00             # Time limit (e.g., 2 hours, adjust as needed for more epochs)
-#SBATCH -o meanteacher_v2_hpc-%j.out  # Standard output file
-#SBATCH -e meanteacher_v2_hpc-%j.err  # Standard error file
+#SBATCH --gres=gpu:1                # Request 1 GPU (can start with 1)
+#SBATCH -n 8                        # Request 8 CPU cores
+#SBATCH --mem=32G                   # Request 32GB RAM
+#SBATCH --time=00:10:00             # Time limit (e.g., 6 hours, for pre-training + MT phase)
+#SBATCH -o slurm_logs/MT_Pre_PhaseEMA-%j.out  # Standard output file (in a slurm_logs subdir)
+#SBATCH -e slurm_logs/MT_Pre_PhaseEMA-%j.err  # Standard error file (in a slurm_logs subdir)
 #SBATCH --mail-type=END,FAIL        # Email notifications
-#SBATCH --job-name=pancreas_mt_v2_hpc # Job name in SLURM
+#SBATCH --job-name=MT_PrePhaseEMA   # Job name in SLURM
 
 # --- Configuration ---
 # HPC specific paths
-DATA_DIR="/scratch/lustre/home/mdah0000/images/preprocessed_v2" # Root directory of preprocessed data
-WORK_DIR="/scratch/lustre/home/mdah0000/smm/v14"                # Directory containing Python scripts
-PYTHON_SCRIPT_NAME="run_mean_teacher_v2.py"                     # The main Python script
+DATA_DIR="/scratch/lustre/home/mdah0000/images/preprocessed_v2"
+WORK_DIR="/scratch/lustre/home/mdah0000/smm/v14"
+PYTHON_SCRIPT_NAME="run_mean_teacher_v2.py"
 PYTHON_SCRIPT_PATH="$WORK_DIR/$PYTHON_SCRIPT_NAME"
-OUTPUT_DIR_BASE="$WORK_DIR/mean_teacher_v2_hpc_results"         # Base directory for HPC experiment outputs
 
-# Experiment specific parameters (adjust for a full run)
-EXPERIMENT_NAME="mt_v2_hpc_$(date +%Y%m%d_%H%M%S)"
+# Base output directory for this series of experiments
+OUTPUT_DIR_ROOT="$WORK_DIR/MT_Experiments_Pretrain_PhasedEMA" 
+
+# Experiment specific parameters
+NUM_LABELED=30                  # Number of labeled patient volumes for training (passed as --num_labeled)
+STUDENT_PRETRAIN_EPOCHS=15      # Epochs for supervised student pre-training
+MT_PHASE_EPOCHS=100             # Epochs for the Mean Teacher phase itself
+
+# Teacher EMA configuration (for Phased EMA in MT phase)
+TEACHER_EMA_WARMUP_EPOCHS=10    # Initial MT epochs with faster EMA
+INITIAL_TEACHER_EMA_DECAY=0.95  # EMA decay during teacher warmup
+BASE_EMA_DECAY=0.999            # EMA decay after teacher warmup (passed as --ema_decay)
+
+# Construct a descriptive experiment name
+EXPERIMENT_NAME="MT_L${NUM_LABELED}_Pre${STUDENT_PRETRAIN_EPOCHS}_TWarm${TEACHER_EMA_WARMUP_EPOCHS}_MT${MT_PHASE_EPOCHS}_$(date +%Y%m%d_%H%M%S)"
+CURRENT_OUTPUT_DIR="$OUTPUT_DIR_ROOT/$EXPERIMENT_NAME"
+
+# Other training parameters
 IMG_SIZE=256
-NUM_LABELED=30                   # Number of labeled patient volumes for training
-NUM_VALIDATION=10                # Number of patient volumes for validation
-BATCH_SIZE=4                     # Batch size (adjust based on GPU memory and dataset)
-NUM_EPOCHS=100                   # Number of training epochs for a proper run
+NUM_VALIDATION=10
+BATCH_SIZE=4
 LEARNING_RATE=1e-4
-EMA_DECAY=0.999
-CONSISTENCY_MAX=0.0
-CONSISTENCY_RAMPUP=30            # Epochs for consistency weight ramp-up
-EARLY_STOPPING_PATIENCE=20
+CONSISTENCY_MAX=10.0             # <<< CORRECTED: Set to a non-zero value
+CONSISTENCY_RAMPUP=30            # Epochs for consistency weight ramp-up (during MT_PHASE_EPOCHS)
+EARLY_STOPPING_PATIENCE=25       # Increased patience slightly for MT phase
 SEED=42
-VERBOSE=1                        # Verbosity mode (0=silent, 1=progress bar, 2=one line per epoch)
+VERBOSE=1
 
 # --- SLURM Preamble ---
 echo "========================================================="
-echo "Running Mean Teacher v2 Learning (HPC) - $(date)"
-echo "========================================================="
-echo "SLURM Job ID: $SLURM_JOB_ID"
-echo "Running on node: $HOSTNAME"
-echo "Allocated GPU(s): $CUDA_VISIBLE_DEVICES"
-echo "Working directory (where script is run from): $(pwd)" # Will be $WORK_DIR after cd
-echo "Python script: $PYTHON_SCRIPT_PATH"
-echo "Data directory: $DATA_DIR"
-echo "Base Output directory: $OUTPUT_DIR_BASE"
-echo "Experiment Name: $EXPERIMENT_NAME"
+echo "Mean Teacher (Student Pre-training & Phased EMA) - $(date)"
+echo "SLURM Job ID: $SLURM_JOB_ID ; Running on node: $HOSTNAME"
+echo "GPU(s): $CUDA_VISIBLE_DEVICES"
+echo "Work Dir: $WORK_DIR ; Python Script: $PYTHON_SCRIPT_PATH"
+echo "Data Dir: $DATA_DIR ; Output Dir: $CURRENT_OUTPUT_DIR"
+echo "--- Experiment Parameters ---"
+echo "Labeled Patients: $NUM_LABELED"
+echo "Student Pre-train Epochs: $STUDENT_PRETRAIN_EPOCHS"
+echo "MT Phase Epochs: $MT_PHASE_EPOCHS"
+echo "Teacher EMA Warmup Epochs (MT Phase): $TEACHER_EMA_WARMUP_EPOCHS"
+echo "Initial Teacher EMA Decay (MT Phase Warmup): $INITIAL_TEACHER_EMA_DECAY"
+echo "Base EMA Decay (MT Phase Post-Warmup): $BASE_EMA_DECAY"
+echo "Consistency Max Weight: $CONSISTENCY_MAX ; Rampup Epochs: $CONSISTENCY_RAMPUP"
+echo "Batch Size: $BATCH_SIZE ; Learning Rate: $LEARNING_RATE"
 echo "========================================================="
 
 # --- Environment Setup ---
-# Create the specific output directory for this experiment run
-CURRENT_OUTPUT_DIR="$OUTPUT_DIR_BASE/$EXPERIMENT_NAME"
 mkdir -p "$CURRENT_OUTPUT_DIR"
-echo "Results will be saved in: $CURRENT_OUTPUT_DIR"
-
-# Verify data directory exists
-if [ ! -d "$DATA_DIR" ]; then
-    echo "ERROR: Data directory '$DATA_DIR' not found. Please ensure your preprocessed data is there."
-    exit 1
-fi
-echo "Using data from: $DATA_DIR"
-
-# Check for available GPU with nvidia-smi
-echo "NVIDIA GPU status:"
-nvidia-smi
-
-# TensorFlow GPU environment settings
-export TF_FORCE_GPU_ALLOW_GROWTH=true
-export TF_CPP_MIN_LOG_LEVEL=1 # Suppress TensorFlow informational messages
-# Optional: Consider mixed precision if your model/TF version supports it well
-# export TF_ENABLE_AUTO_MIXED_PRECISION=1 
+mkdir -p "$WORK_DIR/slurm_logs" 
+if [ ! -d "$DATA_DIR" ]; then echo "ERROR: Data dir '$DATA_DIR' not found."; exit 1; fi
+echo "NVIDIA GPU status:"; nvidia-smi
+export TF_FORCE_GPU_ALLOW_GROWTH=true; export TF_CPP_MIN_LOG_LEVEL=1
 
 # --- Python Environment ---
-# Find Python executable (python3 is preferred)
-PYTHON_CMD=""
-if command -v python3 &>/dev/null; then
-    PYTHON_CMD="python3"
-elif command -v python &>/dev/null; then
-    PYTHON_CMD="python"
-else
-    echo "ERROR: Python executable (python3 or python) not found."
-    exit 1
-fi
+PYTHON_CMD="python3"
+if ! command -v $PYTHON_CMD &> /dev/null; then echo "ERROR: python3 not found."; exit 1; fi
 echo "Using Python: $($PYTHON_CMD --version)"
-echo "Python executable path: $(command -v $PYTHON_CMD)"
-echo "PYTHONPATH: $PYTHONPATH" # Good to check this in the HPC environment
-
-# Optional: Activate a virtual environment if you use one on HPC
-# source /path/to/your/hpc_venv/bin/activate
 
 # --- Execution ---
-# Change to the directory where the Python script and its modules are located.
-# This is crucial for Python to resolve relative imports within your project.
-echo "Changing directory to work dir: $WORK_DIR"
-cd "$WORK_DIR" || { echo "ERROR: Failed to change directory to $WORK_DIR"; exit 1; }
-echo "Current directory after cd: $(pwd)"
+cd "$WORK_DIR" || { echo "ERROR: Failed to cd to $WORK_DIR"; exit 1; }
+if [ ! -f "$PYTHON_SCRIPT_PATH" ]; then echo "ERROR: Script '$PYTHON_SCRIPT_PATH' not found."; exit 1; fi
+echo "TF GPU check:"; $PYTHON_CMD -c "import tensorflow as tf; print('Num GPUs:', len(tf.config.list_physical_devices('GPU')))"
 
-# Check if TensorFlow can see the GPU (after cd and potential venv activation)
-echo "TensorFlow GPU availability check (from $WORK_DIR):"
-$PYTHON_CMD -c "import tensorflow as tf; print('Num GPUs Available:', len(tf.config.list_physical_devices('GPU'))); print('GPU Devices:', tf.config.list_physical_devices('GPU'))"
-
-# Verify the Python script exists
-if [ ! -f "$PYTHON_SCRIPT_PATH" ]; then
-    echo "ERROR: Python script '$PYTHON_SCRIPT_PATH' not found in $WORK_DIR."
-    exit 1
-fi
-# Optional: Add a check for a specific module file to ensure imports will work
-if [ ! -f "config.py" ]; then # Assuming config.py is in WORK_DIR
-    echo "WARNING: config.py not found in $(pwd). Python imports might fail."
-fi
-
-# Run the Mean Teacher v2 training script
-echo "Running Mean Teacher v2 training script: $PYTHON_SCRIPT_NAME"
+echo "Executing Python script: $PYTHON_SCRIPT_NAME"
 $PYTHON_CMD "$PYTHON_SCRIPT_PATH" \
     --data_dir "$DATA_DIR" \
-    --output_dir "$OUTPUT_DIR_BASE" \
+    --output_dir "$OUTPUT_DIR_ROOT" \
     --experiment_name "$EXPERIMENT_NAME" \
     --img_size "$IMG_SIZE" \
     --num_labeled "$NUM_LABELED" \
     --num_validation "$NUM_VALIDATION" \
     --batch_size "$BATCH_SIZE" \
-    --num_epochs "$NUM_EPOCHS" \
+    --student_pretrain_epochs "$STUDENT_PRETRAIN_EPOCHS" \
+    --num_epochs "$MT_PHASE_EPOCHS" \
+    --teacher_ema_warmup_epochs "$TEACHER_EMA_WARMUP_EPOCHS" \
+    --initial_teacher_ema_decay "$INITIAL_TEACHER_EMA_DECAY" \
+    --ema_decay "$BASE_EMA_DECAY" \
     --learning_rate "$LEARNING_RATE" \
-    --ema_decay "$EMA_DECAY" \
     --consistency_max "$CONSISTENCY_MAX" \
     --consistency_rampup "$CONSISTENCY_RAMPUP" \
     --early_stopping_patience "$EARLY_STOPPING_PATIENCE" \
@@ -131,9 +104,8 @@ $PYTHON_CMD "$PYTHON_SCRIPT_PATH" \
 
 # --- Post-Execution ---
 echo "========================================================="
-echo "Mean Teacher v2 training script (HPC) finished at $(date)."
-echo "Output and logs are in $CURRENT_OUTPUT_DIR"
-echo "Check SLURM error file: meanteacher_v2_hpc-$SLURM_JOB_ID.err for any issues."
+echo "Script finished at $(date)."
+echo "Output/logs in $CURRENT_OUTPUT_DIR"
+echo "SLURM error file: $WORK_DIR/slurm_logs/MT_Pre_PhaseEMA-$SLURM_JOB_ID.err"
 echo "========================================================="
-
 exit 0

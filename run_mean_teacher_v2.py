@@ -46,6 +46,10 @@ class DiceBCELoss(tf.keras.losses.Loss):
         })
         return config
 
+class EMAScheduleUpdater(tf.keras.callbacks.Callback):
+    def on_epoch_begin(self, epoch, logs=None):
+        self.model.current_epoch_for_ema.assign(epoch)
+
 class ConsistencyWeightScheduler(tf.keras.callbacks.Callback):
     def __init__(self, consistency_weight_var, max_weight, rampup_epochs):
         super().__init__()
@@ -297,7 +301,13 @@ def main(args):
     teacher_model.set_weights(student_model.get_weights())
     tf.print("Teacher model weights initialized from student model.")
 
-    mean_teacher_trainer = MeanTeacherTrainer(student_model, teacher_model, args.ema_decay)
+    mean_teacher_trainer = MeanTeacherTrainer(
+        student_model=student_model,
+        teacher_model=teacher_model,
+        ema_decay=args.ema_decay, # This becomes base_ema_decay
+        teacher_warmup_epochs=args.teacher_warmup_epochs, # New arg
+        initial_ema_decay=args.initial_ema_decay      # New arg
+    )
     optimizer_mt = tf.keras.optimizers.Adam(learning_rate=args.learning_rate) # Fresh optimizer for MT phase
     supervised_loss_mt = DiceBCELoss()
     student_dice_metric_mt = DiceCoefficient(name='student_dice')
@@ -329,6 +339,13 @@ def main(args):
 
     train_dataset_mt = tf.data.Dataset.zip((labeled_train_dataset_mt, unlabeled_train_dataset_mt))
 
+    # Define MTPhaseEpochUpdater callback
+    class MTPhaseEpochUpdater(tf.keras.callbacks.Callback):
+        def on_epoch_begin(self, epoch, logs=None):
+            # 'epoch' here is the Keras epoch for the current fit() call
+            self.model.mt_phase_current_epoch.assign(epoch) 
+            # tf.print(f"MTPhaseEpochUpdater: Set MeanTeacherTrainer.mt_phase_current_epoch to {epoch}", output_stream=sys.stderr)
+
     callbacks_mt = [
         ConsistencyWeightScheduler(mean_teacher_trainer.consistency_weight, args.consistency_max, args.consistency_rampup),
         tf.keras.callbacks.ModelCheckpoint(
@@ -339,6 +356,9 @@ def main(args):
         tf.keras.callbacks.EarlyStopping(monitor='val_student_dice', patience=args.early_stopping_patience, mode='max', verbose=1, restore_best_weights=True)
     ]
     
+    # Add MTPhaseEpochUpdater to the callbacks list
+    callbacks_mt.append(MTPhaseEpochUpdater())
+
     tf.print(f"--- Starting Mean Teacher Training Phase ({args.num_epochs} epochs) ---")
     start_time_mt = time.time()
     history_mt = mean_teacher_trainer.fit(
@@ -368,6 +388,8 @@ if __name__ == "__main__":
     parser.add_argument("--student_pretrain_epochs", type=int, default=10, help="Epochs for supervised pre-training of student.")
     parser.add_argument("--num_epochs", type=int, default=100, help="Epochs for Mean Teacher training phase.")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--teacher_ema_warmup_epochs", type=int, default=5, help="Number of initial MT phase epochs for faster teacher EMA updates.")
+    parser.add_argument("--initial_teacher_ema_decay", type=float, default=0.95, help="EMA decay for teacher during its warmup epochs.")
     parser.add_argument("--early_stopping_patience", type=int, default=20)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--consistency_max", type=float, default=10.0)
