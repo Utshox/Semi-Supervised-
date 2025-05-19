@@ -1,3 +1,4 @@
+
 import tensorflow as tf
 #import tensorflow_addons as tfa
 import numpy as np
@@ -14,6 +15,8 @@ from models_tf2 import *
 from data_loader_tf2 import DataPipeline, PancreasDataLoader
 from visualization import ExperimentVisualizer
 
+
+AUTOTUNE = tf.data.experimental.AUTOTUNE
 #mean_teacher
 #GPU
 def setup_gpu():
@@ -738,207 +741,141 @@ class StableSSLTrainer:
 # In train_ssl_tf2n.py
 
 class MeanTeacherTrainer(tf.keras.Model):
-    def __init__(self, student_model, teacher_model, ema_decay,
-                 # Parameters for Phased EMA
-                 teacher_warmup_epochs=0, 
-                 initial_teacher_ema_decay=0.95, 
+    def __init__(self, student_model, teacher_model, 
+                 ema_decay, # This is the base_ema_decay
                  sharpening_temperature=0.5,
-                 **kwargs): # Keep **kwargs for other tf.keras.Model arguments
-        super().__init__(**kwargs) # Pass **kwargs to the parent constructor
+                 # No teacher_direct_copy_epochs needed here by __init__
+                 **kwargs):
+        super().__init__(**kwargs)
         self.student_model = student_model
         self.teacher_model = teacher_model
-        
-        self.base_ema_decay = ema_decay # This is the target high decay (e.g., 0.999) after warmup
-        self.teacher_ema_warmup_epochs = teacher_warmup_epochs # Epochs in MT phase for faster teacher updates
-        self.initial_teacher_ema_decay = initial_teacher_ema_decay # EMA decay during these teacher_ema_warmup_epochs
-        self.sharpening_temperature = tf.constant(sharpening_temperature, dtype=tf.float32) # Temperature for sharpening logits
-        self.teacher_model.trainable = False # Teacher is not trained by optimizer
-
+        self.base_ema_decay = tf.cast(ema_decay, tf.float32)
+        self.sharpening_temperature = tf.constant(sharpening_temperature, dtype=tf.float32)
+        self.teacher_model.trainable = False
         self.consistency_weight = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="consistency_weight")
-        self.consistency_loss_fn = tf.keras.losses.MeanSquaredError() # Standard MSE for prob difference
-        
-        # To track the current epoch within the Mean Teacher training phase (updated by a callback)
+        self.consistency_loss_fn = tf.keras.losses.MeanSquaredError()
+        # mt_phase_current_epoch is still set by MTPhaseEpochUpdater in run_mean_teacher_v2.py
+        # It's used by ConsistencyWeightScheduler for delay.
         self.mt_phase_current_epoch = tf.Variable(-1, dtype=tf.int32, trainable=False, name="mt_phase_epoch_counter")
 
-    def _update_teacher_model(self):
-        current_epoch_mt_phase = self.mt_phase_current_epoch # This is a tf.Variable (int32)
+    def _update_teacher_model(self): # This is called per batch
+        # This method ONLY performs the standard EMA update using self.base_ema_decay.
+        # The TeacherDirectCopyCallback handles the initial direct copy at epoch_begin.
         
-        # --- Convert Python ints/floats to TF Tensors for comparison if not already ---
-        # self.teacher_ema_warmup_epochs is a Python int from __init__
-        # self.initial_teacher_ema_decay is a Python float
-        # self.base_ema_decay is a Python float
+        for s_var, t_var in zip(self.student_model.trainable_variables, self.teacher_model.trainable_variables):
+            t_var.assign(self.base_ema_decay * t_var + (1.0 - self.base_ema_decay) * s_var)
         
-        # Condition for using initial_teacher_ema_decay
-        # All parts of the condition must result in TF boolean tensors
-        cond1 = tf.greater(tf.cast(self.teacher_ema_warmup_epochs, tf.int32), 0) # True if teacher_ema_warmup_epochs > 0
-        cond2 = tf.less(current_epoch_mt_phase, tf.cast(self.teacher_ema_warmup_epochs, tf.int32)) # True if current_epoch < teacher_ema_warmup_epochs
-        cond3 = tf.not_equal(current_epoch_mt_phase, tf.constant(-1, dtype=tf.int32)) # True if current_epoch has been set
-
-        # Combine conditions using tf.logical_and
-        is_in_teacher_warmup_phase = tf.logical_and(cond1, tf.logical_and(cond2, cond3))
-
-        # Use tf.cond to select the effective_ema_decay
-        effective_ema_decay = tf.cond(
-            is_in_teacher_warmup_phase,
-            lambda: tf.cast(self.initial_teacher_ema_decay, tf.float32), # True branch
-            lambda: tf.cast(self.base_ema_decay, tf.float32)             # False branch
-        )
-        
-        # Optional: tf.print for debugging the EMA decay being used (conditionally)
-        # This print will execute based on the TF graph's control flow.
-        # def print_warmup():
-        #     tf.print(f"EMA Update: MT Epoch {current_epoch_mt_phase + 1}, using WARMUP EMA: {effective_ema_decay}", output_stream=sys.stderr)
-        #     return tf.constant(True) # Dummy return for tf.cond
-        # def print_base():
-        #     tf.print(f"EMA Update: MT Epoch {current_epoch_mt_phase + 1}, using BASE EMA: {effective_ema_decay}", output_stream=sys.stderr)
-        #     return tf.constant(True)
-        # _ = tf.cond(is_in_teacher_warmup_phase, print_warmup, print_base)
-
-
-        for student_var, teacher_var in zip(self.student_model.trainable_variables, self.teacher_model.trainable_variables):
-            # Ensure dtypes match if necessary, though assign usually handles it
-            # student_val_casted = tf.cast(student_var, teacher_var.dtype)
-            # teacher_var.assign(effective_ema_decay * teacher_var + (1.0 - effective_ema_decay) * student_val_casted)
-            teacher_var.assign(effective_ema_decay * teacher_var + (1.0 - effective_ema_decay) * student_var)
-
+        student_all_weights = self.student_model.weights
+        teacher_all_weights = self.teacher_model.weights
+        if len(student_all_weights) == len(teacher_all_weights):
+            for s_w, t_w in zip(student_all_weights, teacher_all_weights):
+                if not t_w.trainable: # For non-trainable like BN moving_mean, moving_variance
+                    if s_w.shape == t_w.shape: t_w.assign(s_w) 
+        return # No return value needed
+            
     def _calculate_dice(self, y_true, y_pred_logits, smooth=1e-6):
-        # y_true shape: (batch, H, W, 1)
-        # y_pred_logits shape: (batch, H, W, 1)
         y_true_f = tf.cast(y_true, tf.float32)
-        y_pred_probs = tf.nn.sigmoid(y_pred_logits) # Convert logits to probabilities
-        y_pred_f_binary = tf.cast(y_pred_probs > 0.5, tf.float32) # Binarize predictions
-
-        # Calculate Dice per sample in the batch then average
-        intersection = tf.reduce_sum(y_true_f * y_pred_f_binary, axis=[1, 2, 3]) # Sum over H, W, C (Channel is 1)
+        y_pred_probs = tf.nn.sigmoid(y_pred_logits)
+        y_pred_f_binary = tf.cast(y_pred_probs > 0.5, tf.float32)
+        intersection = tf.reduce_sum(y_true_f * y_pred_f_binary, axis=[1, 2, 3])
         sum_true = tf.reduce_sum(y_true_f, axis=[1, 2, 3])
         sum_pred = tf.reduce_sum(y_pred_f_binary, axis=[1, 2, 3])
-        
         dice_per_sample = (2. * intersection + smooth) / (sum_true + sum_pred + smooth)
-        
-        return tf.reduce_mean(dice_per_sample) # Average Dice across the batch
+        return tf.reduce_mean(dice_per_sample)
 
-    def compile(self, optimizer, loss, metrics=None, **kwargs):
+    def compile(self, optimizer, loss, metrics=None, **kwargs): # Expects 'loss'
         super().compile(optimizer=optimizer, loss=loss, metrics=metrics, **kwargs)
-        # self.compiled_loss refers to supervised_loss_fn
-        # self.compiled_metrics refers to metrics
 
     @property
     def metrics(self):
-        # This ensures Keras tracks metrics correctly.
-        # It starts with metrics passed to compile (like student_dice).
-        # If you had metrics you only wanted to update in train_step but not display, you'd manage them differently.
-        return super().metrics 
+        return super().metrics
 
     def train_step(self, data):
         labeled_data, unlabeled_data = data
         labeled_images, true_labels = labeled_data
-        unlabeled_student_input, unlabeled_teacher_input = unlabeled_data # These are (student_aug, teacher_aug)
+        unlabeled_student_input, unlabeled_teacher_input = unlabeled_data
 
         with tf.GradientTape() as tape:
-            # Supervised loss on labeled data
             student_labeled_logits = self.student_model(labeled_images, training=True)
-            supervised_loss = self.compiled_loss(
-                true_labels, 
-                student_labeled_logits, 
-                regularization_losses=self.student_model.losses # Include model's internal regularization losses
-            )
+            supervised_loss = self.compiled_loss(true_labels, student_labeled_logits, regularization_losses=self.student_model.losses)
 
-            # Consistency loss on unlabeled data
             student_unlabeled_logits = self.student_model(unlabeled_student_input, training=True)
-            teacher_unlabeled_logits = self.teacher_model(unlabeled_teacher_input, training=False) # Teacher not in training mode
+            teacher_unlabeled_logits = self.teacher_model(unlabeled_teacher_input, training=False)
             
-            sharpened_teacher_logits = teacher_unlabeled_logits / self.sharpening_temperature 
-            sharpened_teacher_probs_for_consistency = tf.nn.sigmoid(sharpened_teacher_logits)
+            raw_sharpened_logits = teacher_unlabeled_logits / self.sharpening_temperature
+            clipped_sharpened_logits = tf.clip_by_value(raw_sharpened_logits, -15.0, 15.0) # Clip range
+            sharpened_teacher_probs_for_consistency = tf.nn.sigmoid(clipped_sharpened_logits)
+
+            # sharpened_teacher_logits = teacher_unlabeled_logits / self.sharpening_temperature 
+            #sharpened_teacher_probs_for_consistency = tf.nn.sigmoid(sharpened_teacher_logits)
 
             student_unlabeled_probs = tf.nn.sigmoid(student_unlabeled_logits)
-            teacher_unlabeled_probs = tf.nn.sigmoid(teacher_unlabeled_logits) # Teacher output also needs sigmoid
+            consistency_loss_value = self.consistency_loss_fn(sharpened_teacher_probs_for_consistency, student_unlabeled_probs)
             
-            consistency_loss_value = self.consistency_loss_fn(teacher_unlabeled_probs, student_unlabeled_probs)
-            
-            # Total loss calculation
             total_loss = supervised_loss + self.consistency_weight * consistency_loss_value
 
-        # Compute gradients for student model
         gradients = tape.gradient(total_loss, self.student_model.trainable_variables)
+        clipped_gradients = []
+        for g in gradients:
+            if g is not None:
+                clipped_gradients.append(tf.clip_by_global_norm([g], 1.0)[0][0]) # Clip one gradient at a time
+            else:
+                clipped_gradients.append(None)
+        # Or simpler if all gradients are always present:
+        # gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
+
+        # Filter out None gradients before zipping with variables, if using the individual clipping
+        trainable_vars = self.student_model.trainable_variables
+        grads_and_vars = []
+        for g, v in zip(clipped_gradients, trainable_vars):
+            if g is not None:
+                grads_and_vars.append((g, v))       
         self.optimizer.apply_gradients(zip(gradients, self.student_model.trainable_variables))
 
-        # Update teacher model using EMA (uses self.mt_phase_current_epoch)
-        self._update_teacher_model()
+        self._update_teacher_model() # This now ONLY does base EMA + BN copy
 
-        # Update compiled Keras metrics (e.g., student_dice on labeled data)
         self.compiled_metrics.update_state(true_labels, student_labeled_logits)
 
-        # Prepare logs to be returned: these must be TENSOR objects
-        logs = {
-            'loss': total_loss, 
-            'supervised_loss': supervised_loss, 
-            'consistency_loss': consistency_loss_value
-        }
-        # Add results from compiled metrics (e.g., student_dice.result())
-        for metric in self.metrics: # self.metrics includes metrics passed to compile()
-            logs[metric.name] = metric.result()
-        
+        logs = {'loss': total_loss, 'supervised_loss': supervised_loss, 'consistency_loss': consistency_loss_value}
+        for metric in self.metrics: logs[metric.name] = metric.result()
         return logs
 
-    # In train_ssl_tf2n.py, class MeanTeacherTrainer
     def test_step(self, data):
         val_images, val_labels = data
-
-        # Student model evaluation
         student_val_logits = self.student_model(val_images, training=False)
         val_student_loss = self.compiled_loss(val_labels, student_val_logits, regularization_losses=self.student_model.losses)
-        self.compiled_metrics.update_state(val_labels, student_val_logits)
+        self.compiled_metrics.update_state(val_labels, student_val_logits) # For val_student_dice
 
-        # Teacher model evaluation
         teacher_val_logits = self.teacher_model(val_images, training=False)
         teacher_dice_score_batch = self._calculate_dice(val_labels, teacher_val_logits)
-
-        # --- ENHANCED DEBUGGING FOR TEACHER PREDICTIONS ---
-        # This will run for every validation batch. It might be very verbose.
-        # Consider adding a counter or condition to print less frequently if needed.
-        # Example: if self.optimizer.iterations % 10 == 0 (if optimizer is accessible and relevant)
-        # Or use a tf.Variable as a counter for debug prints.
         
-        # For debugging, let's look at the raw components for the current batch
-        y_true_b = tf.cast(val_labels, tf.float32)
-        teacher_pred_probs_b = tf.nn.sigmoid(teacher_val_logits)
-        teacher_pred_binary_b = tf.cast(teacher_pred_probs_b > 0.5, tf.float32)
-
-        # Sums per sample in the batch
-        gt_sums_per_sample = tf.reduce_sum(y_true_b, axis=[1, 2, 3]) # Sum over H, W, C
-        teacher_pred_sums_per_sample = tf.reduce_sum(teacher_pred_binary_b, axis=[1, 2, 3])
-
-        # Number of samples in batch where GT is all zero
-        num_gt_empty = tf.reduce_sum(tf.cast(tf.equal(gt_sums_per_sample, 0.0), tf.int32))
-        # Number of samples in batch where Teacher prediction is all zero
-        num_teacher_pred_empty = tf.reduce_sum(tf.cast(tf.equal(teacher_pred_sums_per_sample, 0.0), tf.int32))
-
-        # Number of samples where BOTH GT and Teacher pred are empty
-        both_empty_mask = tf.logical_and(tf.equal(gt_sums_per_sample, 0.0), tf.equal(teacher_pred_sums_per_sample, 0.0))
-        num_both_empty = tf.reduce_sum(tf.cast(both_empty_mask, tf.int32))
-
-        # Average teacher probability for this batch (can indicate if it's always predicting low values)
-        avg_teacher_prob_batch = tf.reduce_mean(teacher_pred_probs_b)
-
-        tf.print(
-            "DEBUG ValBatch Teacher - BatchDice:", teacher_dice_score_batch,
-            "| GT empty samples:", num_gt_empty, "/", tf.shape(val_labels)[0],
-            "| TeacherPred empty samples:", num_teacher_pred_empty, "/", tf.shape(val_labels)[0],
-            "| BothEmpty samples:", num_both_empty, "/", tf.shape(val_labels)[0],
-            "| AvgTeacherProb:", avg_teacher_prob_batch,
-            # Optional: print sums for first sample for more detail
-            # "| S0_GT Sum:", gt_sums_per_sample[0] if tf.shape(val_labels)[0] > 0 else -1,
-            # "| S0_TeacherPred Sum:", teacher_pred_sums_per_sample[0] if tf.shape(val_labels)[0] > 0 else -1,
-            output_stream=sys.stderr,
-            summarize=-1 # Print all elements of tensors if they are small
-        )
-        # --- END ENHANCED DEBUGGING ---
+        # --- UNCOMMENT THE DEBUG BLOCK BELOW IF YOU STILL GET TEACHER DICE = 1.0 ---
+        # if tf.config.functions_run_eagerly() or tf.compat.v1.executing_eagerly_outside_functions():
+        #     y_true_b = tf.cast(val_labels, tf.float32)
+        #     teacher_pred_probs_b = tf.nn.sigmoid(teacher_val_logits)
+        #     teacher_pred_binary_b = tf.cast(teacher_pred_probs_b > 0.5, tf.float32)
+        #     gt_sums_per_sample = tf.reduce_sum(y_true_b, axis=[1,2,3])
+        #     teacher_pred_sums_per_sample = tf.reduce_sum(teacher_pred_binary_b, axis=[1,2,3])
+        #     num_gt_empty = tf.reduce_sum(tf.cast(tf.equal(gt_sums_per_sample, 0.0), tf.int32))
+        #     num_teacher_pred_empty = tf.reduce_sum(tf.cast(tf.equal(teacher_pred_sums_per_sample, 0.0), tf.int32))
+        #     both_empty_mask = tf.logical_and(tf.equal(gt_sums_per_sample, 0.0), tf.equal(teacher_pred_sums_per_sample, 0.0))
+        #     num_both_empty = tf.reduce_sum(tf.cast(both_empty_mask, tf.int32))
+        #     avg_teacher_prob_batch = tf.reduce_mean(teacher_pred_probs_b)
+        #     tf.print(
+        #         "DEBUG ValBatch Teacher - BatchDice:", teacher_dice_score_batch,
+        #         "| GT empty samples:", num_gt_empty, "/", tf.shape(val_labels)[0],
+        #         "| TeacherPred empty samples:", num_teacher_pred_empty, "/", tf.shape(val_labels)[0],
+        #         "| BothEmpty samples:", num_both_empty, "/", tf.shape(val_labels)[0],
+        #         "| AvgTeacherProb:", avg_teacher_prob_batch,
+        #         output_stream=sys.stderr, summarize=-1
+        #     )
         
         final_logs = {'loss': val_student_loss, 'teacher_dice': teacher_dice_score_batch}
         for metric in self.metrics: 
-            final_logs[metric.name] = metric.result() # Keras handles val_ prefix
+            final_logs[metric.name] = metric.result()
             
         return final_logs
+
 
 class StableConsistencyLoss(tf.keras.losses.Loss):
     """Stable Consistency Loss with temperature scaling"""
@@ -977,409 +914,234 @@ class CombinedSSLLoss(tf.keras.losses.Loss):
 #########################
 # In train_ssl_tf2n.py, modify/replace the MixMatchTrainer:
 
-class MixMatchTrainer: # Ensure this is the one being used, not an older version
-    def __init__(self, config):
-        print("Initializing MixMatch Trainer (Revised)...")
+class MixMatchTrainer:
+    def __init__(self, config): # Expects StableSSLConfig or similar
+        tf.print("Initializing MixMatch Trainer...")
         self.config = config
-        
-        # Ensure proper batch sizes
-        self.config.batch_size = min(8, self.config.batch_size) # Let user control via args
-        
-        # Initialize data pipeline
-        self.data_pipeline = DataPipeline(config)
-        
-        # MixMatch hyperparameters from config or defaults
-        self.T = getattr(config, 'mixmatch_T', 0.5)  # Temperature sharpening
-        self.K = getattr(config, 'mixmatch_K', 2)    # Number of augmentations for pseudo-label
-        self.alpha = getattr(config, 'mixmatch_alpha', 0.75)  # Beta distribution parameter for MixUp
-        self.max_consistency_weight = getattr(config, 'mixmatch_consistency_max', 10.0)
-        self.rampup_length_steps = getattr(config, 'mixmatch_rampup_steps', 1000) # Rampup in steps
+        # Ensure DataPipeline is correctly imported or defined if PancreasDataLoader is separate
+        self.data_pipeline = DataPipeline(config) 
 
-        # EMA parameters for teacher model
-        self.initial_ema_decay = getattr(config, 'initial_ema_decay', 0.95)
-        self.final_ema_decay = getattr(config, 'ema_decay', 0.999) # Final target EMA decay
-        self.ema_warmup_steps = getattr(config, 'ema_warmup_steps', 1000) # Steps for EMA decay to ramp up
-        
-        # Create output directories
-        self.output_dir_base = Path(getattr(config, 'output_dir', 'mixmatch_results_default')) # Get from config
+        # MixMatch hyperparameters from config or defaults
+        self.T = getattr(config, 'mixmatch_T', 0.5)
+        self.K = getattr(config, 'mixmatch_K', 2)
+        self.alpha_mixup = getattr(config, 'mixmatch_alpha', 0.75) # MixUp alpha
+        self.lambda_u_max = getattr(config, 'mixmatch_consistency_max', 75.0) # Max weight for unlabeled loss
+        self.lambda_u_rampup_steps = getattr(config, 'mixmatch_rampup_steps', 500) 
+
+        # Output directories
+        self.output_dir_base = Path(getattr(config, 'output_dir', 'mixmatch_results_default'))
         self.experiment_name = getattr(config, 'experiment_name', f"MixMatch_Exp_{time.strftime('%Y%m%d_%H%M%S')}")
         self.output_dir = self.output_dir_base / self.experiment_name
         self.checkpoint_dir = self.output_dir / 'checkpoints'
-        self.plot_dir = self.output_dir / 'plots'
-        
+        self.plots_dir = self.output_dir / 'plots'
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.plot_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize models
-        print("Creating student and teacher models...")
-        self.student_model = PancreasSeg(config)
-        self.teacher_model = PancreasSeg(config) # EMA of student
-        
-        dummy_input_shape = (1, config.img_size_x, config.img_size_y, config.num_channels)
-        self.student_model.build(input_shape=dummy_input_shape)
-        self.teacher_model.build(input_shape=dummy_input_shape)
-        self.teacher_model.set_weights(self.student_model.get_weights())
-        self.teacher_model.trainable = False # Teacher is not trained by optimizer
-        
-        # Setup optimizer
-        initial_lr = getattr(config, 'learning_rate', 1e-4) # Get from config
+        self.plots_dir.mkdir(parents=True, exist_ok=True)
+        tf.print(f"MixMatch results, checkpoints, plots will be in: {self.output_dir}")
+
+        # Model
+        tf.print("Creating MixMatch student model...")
+        self.model = PancreasSeg(config) 
+        dummy_input_shape = (1, config.img_size_y, config.img_size_x, config.num_channels)
+        try:
+            _ = self.model(tf.zeros(dummy_input_shape), training=False)
+            tf.print(f"MixMatch student model '{self.model.name}' built.")
+        except Exception as e:
+            tf.print(f"ERROR building MixMatch student model: {e}", output_stream=sys.stderr); raise e
+
+        # Optimizer and Learning Rate Schedule
+        initial_lr_val = getattr(config, 'learning_rate', 0.002) 
+        decay_steps_val = getattr(config, 'lr_decay_steps', 1000) # Example: steps for one decay cycle
+
         self.lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-            initial_lr, 
-            first_decay_steps=getattr(config, 'lr_decay_steps', 500), # steps, not epochs
-            t_mul=2.0, m_mul=0.95, alpha=0.1 # alpha is min_lr_factor
+            initial_learning_rate=initial_lr_val, 
+            first_decay_steps=decay_steps_val, 
+            t_mul=2.0, m_mul=0.95, alpha=0.01 # alpha is min_lr_factor
         )
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr_schedule)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr_schedule) # Assign schedule
+        tf.print(f"MixMatch Optimizer: Adam with CosineDecayRestarts LR schedule (initial: {initial_lr_val}).")
         
-        # Loss functions
-        self.supervised_loss_fn = CombinedLoss(config) # Dice + Focal
-        self.consistency_loss_fn = tf.keras.losses.MeanSquaredError() # L2 loss for consistency
-        
-        # History tracking
+        # Loss Functions
+        self.supervised_loss_fn = CombinedLoss(config) # Assumes CombinedLoss uses Dice+Focal
+        self.unsupervised_loss_fn = tf.keras.losses.MeanSquaredError()
+
         self.history = {
-            'epoch': [], 'total_loss': [], 'supervised_loss': [], 'consistency_loss': [],
-            'val_student_dice': [], 'val_teacher_dice': [], 'learning_rate': []
+            'epoch': [], 'total_loss': [], 'L_x': [], 'L_u': [], 'lambda_u': [],
+            'val_dice': [], 'learning_rate': []
         }
-        print("MixMatch trainer initialization complete!")
+        tf.print("MixMatch trainer initialization complete!")
 
-    def _sharpen_sigmoid_probs(self, p, T):
-        """Sharpen sigmoid probabilities. p is a probability (0 to 1)."""
-        if T == 0: # Avoid division by zero, effectively becomes argmax
-            return tf.cast(p > 0.5, p.dtype)
-        p_sharp = p**(1/T)
-        return p_sharp / (p_sharp + (1-p)**(1/T) + 1e-7) # Add epsilon for stability
+    def _sharpen_probs(self, p, T):
+        if T == 0: return tf.cast(p > 0.5, p.dtype)
+        p_pow_t = tf.pow(p, 1.0/T)
+        one_minus_p_pow_t = tf.pow(1.0 - p, 1.0/T)
+        return p_pow_t / (p_pow_t + one_minus_p_pow_t + 1e-7)
 
-    def mixup(self, x1, x2, y1, y2, alpha):
-        """Performs mixup augmentation. y1, y2 are probabilities."""
+    def _mixup(self, x1, x2, y1, y2, alpha):
         batch_size = tf.shape(x1)[0]
-        
-        # Beta distribution for mixing coefficient
-        beta_dist = tf.compat.v1.distributions.Beta(alpha, alpha)
+        # Use tfp.distributions.Beta if available and preferred, otherwise tf.compat.v1 works
+        try:
+            beta_dist =  tf.compat.v1.distributions.Beta(alpha, alpha)
+        except ImportError:
+            tf.print("WARNING: tensorflow_probability not found, using tf.compat.v1.distributions.Beta for MixUp.", output_stream=sys.stderr)
+            beta_dist = tf.compat.v1.distributions.Beta(alpha, alpha)
+            
         lambda_ = beta_dist.sample(batch_size)
-        lambda_ = tf.maximum(lambda_, 1.0 - lambda_) # Ensure lambda >= 0.5
-        
-        lambda_x = tf.reshape(lambda_, [batch_size, 1, 1, 1])
-        mixed_x = lambda_x * x1 + (1.0 - lambda_x) * x2
-        
-        # For labels (probabilities), reshape lambda appropriately
-        # y1, y2 have shape [batch, H, W, 1]
-        lambda_y = tf.reshape(lambda_, [batch_size, 1, 1, 1]) # Ensure it broadcasts correctly
-        mixed_y = lambda_y * y1 + (1.0 - lambda_y) * y2
-        
-        return mixed_x, mixed_y
+        lambda_ = tf.maximum(lambda_, 1.0 - lambda_)
+        lambda_x_reshaped = tf.reshape(lambda_, [batch_size, 1, 1, 1])
+        x_mixed = lambda_x_reshaped * x1 + (1.0 - lambda_x_reshaped) * x2
+        lambda_y_reshaped = tf.reshape(lambda_, [batch_size, 1, 1, 1])
+        y_mixed = lambda_y_reshaped * y1 + (1.0 - lambda_y_reshaped) * y2
+        return x_mixed, y_mixed, lambda_
 
-    def _update_teacher_ema(self):
-        current_step = tf.cast(self.optimizer.iterations, tf.float32)
-        
-        # Ramp up EMA decay factor
-        ramp_ratio = tf.minimum(1.0, current_step / tf.cast(self.ema_warmup_steps, tf.float32))
-        current_decay = self.initial_ema_decay + (self.final_ema_decay - self.initial_ema_decay) * ramp_ratio
-        
-        for student_var, teacher_var in zip(
-                self.student_model.trainable_variables,
-                self.teacher_model.trainable_variables):
-            teacher_var.assign(current_decay * teacher_var + (1.0 - current_decay) * student_var)
+    def _get_lambda_u(self, step):
+        return self.lambda_u_max * tf.minimum(1.0, tf.cast(step, tf.float32) / tf.cast(self.lambda_u_rampup_steps, tf.float32))
 
     @tf.function
-    def train_step(self, labeled_batch, unlabeled_batch_single_view):
-        images_l, labels_l = labeled_batch 
-        images_u_raw_batch = unlabeled_batch_single_view[0] # This is a BATCH of raw unlabeled images [B, H, W, C]
+    def train_step(self, labeled_batch, unlabeled_batch_raw):
+        images_xl, labels_pl = labeled_batch 
+        images_xu_raw = unlabeled_batch_raw[0] 
 
-        # --- Generate Pseudo-Labels for Unlabeled Data ---
-        list_of_teacher_probs_on_aug_u = []
+        guessed_labels_qb_list = []
         for _ in range(self.K):
-            # --- Apply weak augmentation to EACH image in the images_u_raw_batch ---
-            # We need to map the augmentation function over the batch dimension.
-            current_k_weak_aug_batch = tf.map_fn(
-                lambda x: self.data_pipeline.dataloader._augment_single_image_slice(x, strength='weak'),
-                images_u_raw_batch # Pass the entire batch here
-            )
-            # current_k_weak_aug_batch will also be [B, H, W, C]
-            
-            logits_u_k_teacher = self.teacher_model(current_k_weak_aug_batch, training=False)
-            probs_u_k_teacher = tf.nn.sigmoid(logits_u_k_teacher)
-            list_of_teacher_probs_on_aug_u.append(probs_u_k_teacher)
+            xu_k_aug = tf.map_fn(lambda x: self.data_pipeline.dataloader._augment_single_image_slice(x, strength='weak'), images_xu_raw)
+            logits_xu_k = self.model(xu_k_aug, training=False)
+            probs_xu_k = tf.nn.sigmoid(logits_xu_k)
+            guessed_labels_qb_list.append(probs_xu_k)
         
-        avg_teacher_probs_u = tf.reduce_mean(tf.stack(list_of_teacher_probs_on_aug_u, axis=0), axis=0)
-        pseudo_labels_target_probs = self._sharpen_sigmoid_probs(avg_teacher_probs_u, self.T)
+        avg_guessed_probs_qb = tf.reduce_mean(tf.stack(guessed_labels_qb_list), axis=0)
+        sharpened_pseudo_labels_qu = self._sharpen_probs(avg_guessed_probs_qb, self.T)
 
-        # --- Augmentations for Student Model Input (applied to BATCHES) ---
-        # images_l is already a batch [B_l, H, W, C]
-        # images_u_raw_batch is also a batch [B_u, H, W, C]
+        images_xl_aug = tf.map_fn(lambda x: self.data_pipeline.dataloader._augment_single_image_slice(x, strength='strong'), images_xl)
+        images_xu_aug = tf.map_fn(lambda x: self.data_pipeline.dataloader._augment_single_image_slice(x, strength='strong'), images_xu_raw)
 
-        images_l_strong_aug_batch = tf.map_fn(
-            lambda x: self.data_pipeline.dataloader._augment_single_image_slice(x, strength='strong'),
-            images_l # Pass the labeled batch
-        )
-        images_u_strong_aug_batch = tf.map_fn(
-            lambda x: self.data_pipeline.dataloader._augment_single_image_slice(x, strength='strong'),
-            images_u_raw_batch # Pass the unlabeled batch
-        )
-
-        # --- MixUp ---
-        # MixUp for supervised part:
-        bs_l = tf.shape(images_l_strong_aug_batch)[0]
+        bs_l = tf.shape(images_xl_aug)[0]
         shuffle_l_indices = tf.random.shuffle(tf.range(bs_l))
-        images_l_mixed, labels_l_mixed = self.mixup(
-            images_l_strong_aug_batch, tf.gather(images_l_strong_aug_batch, shuffle_l_indices),
-            labels_l, tf.gather(labels_l, shuffle_l_indices), 
-            self.alpha
-        )
+        X_l_mixed, P_l_mixed, _ = self._mixup(
+            images_xl_aug, tf.gather(images_xl_aug, shuffle_l_indices),
+            labels_pl, tf.gather(labels_pl, shuffle_l_indices), self.alpha_mixup)
 
-        # MixUp for unsupervised part:
-        bs_u = tf.shape(images_u_strong_aug_batch)[0]
+        bs_u = tf.shape(images_xu_aug)[0]
         shuffle_u_indices = tf.random.shuffle(tf.range(bs_u))
-        images_u_mixed, pseudo_labels_target_probs_mixed = self.mixup(
-            images_u_strong_aug_batch, tf.gather(images_u_strong_aug_batch, shuffle_u_indices),
-            pseudo_labels_target_probs, tf.gather(pseudo_labels_target_probs, shuffle_u_indices),
-            self.alpha
-        )
+        X_u_mixed, Q_u_mixed, _ = self._mixup(
+            images_xu_aug, tf.gather(images_xu_aug, shuffle_u_indices),
+            sharpened_pseudo_labels_qu, tf.gather(sharpened_pseudo_labels_qu, shuffle_u_indices), self.alpha_mixup)
             
         with tf.GradientTape() as tape:
-            logits_l_student_on_mixed = self.student_model(images_l_mixed, training=True)
-            logits_u_student_on_mixed = self.student_model(images_u_mixed, training=True)
+            logits_Lx_student = self.model(X_l_mixed, training=True)
+            loss_Lx = self.supervised_loss_fn(P_l_mixed, logits_Lx_student) 
 
-            supervised_loss = self.supervised_loss_fn(labels_l_mixed, logits_l_student_on_mixed)
-            
-            student_probs_u_on_mixed = tf.nn.sigmoid(logits_u_student_on_mixed)
-            consistency_loss = self.consistency_loss_fn(pseudo_labels_target_probs_mixed, student_probs_u_on_mixed)
-            
-            current_step_float = tf.cast(self.optimizer.iterations, tf.float32)
-            consistency_weight_val = self.max_consistency_weight * tf.minimum(1.0, current_step_float / tf.cast(self.rampup_length_steps, tf.float32))
-            
-            total_loss = supervised_loss + consistency_weight_val * consistency_loss
+            logits_Lu_student = self.model(X_u_mixed, training=True)
+            probs_Lu_student = tf.nn.sigmoid(logits_Lu_student)
+            loss_Lu = self.unsupervised_loss_fn(Q_u_mixed, probs_Lu_student)
 
-        trainable_vars = self.student_model.trainable_variables
+            lambda_u_weight = self._get_lambda_u(self.optimizer.iterations)
+            total_loss = loss_Lx + lambda_u_weight * loss_Lu
+        
+        trainable_vars = self.model.trainable_variables
         gradients = tape.gradient(total_loss, trainable_vars)
-        gradients = [tf.clip_by_norm(g, 1.0) if g is not None else tf.zeros_like(v) for g, v in zip(gradients, trainable_vars)]
-        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+        clipped_grads = [(tf.clip_by_norm(g, 1.0) if g is not None else None) for g in gradients]
+        grads_and_vars_final = [(g,v) for g,v in zip(clipped_grads, trainable_vars) if g is not None]
+        self.optimizer.apply_gradients(grads_and_vars_final)
 
-        self._update_teacher_ema()
-
-        return {
-            'total_loss': total_loss,
-            'supervised_loss': supervised_loss,
-            'consistency_loss': consistency_loss,
-            'consistency_weight': consistency_weight_val
-        }
+        return {'total_loss': total_loss, 'L_x': loss_Lx, 'L_u': loss_Lu, 'lambda_u': lambda_u_weight}
     
     def _compute_dice_metric(self, y_true, y_pred_logits):
-        """Computes Dice score for validation. y_pred_logits are model outputs."""
-        y_true = tf.cast(y_true, tf.float32)
-        # Sigmoid and threshold for Dice calculation
+        y_true_f = tf.cast(y_true, tf.float32)
         y_pred_probs = tf.nn.sigmoid(y_pred_logits)
-        y_pred_binary = tf.cast(y_pred_probs > 0.5, tf.float32)
-        
-        intersection = tf.reduce_sum(y_true * y_pred_binary, axis=[1, 2, 3]) # Sum over H, W, C
-        union = tf.reduce_sum(y_true, axis=[1, 2, 3]) + tf.reduce_sum(y_pred_binary, axis=[1, 2, 3])
-        
-        dice = (2. * intersection + 1e-6) / (union + 1e-6)
-        return tf.reduce_mean(dice)
+        y_pred_f_binary = tf.cast(y_pred_probs > 0.5, tf.float32)
+        intersection = tf.reduce_sum(y_true_f * y_pred_f_binary, axis=[1,2,3])
+        union_sum = tf.reduce_sum(y_true_f, axis=[1,2,3]) + tf.reduce_sum(y_pred_f_binary, axis=[1,2,3])
+        dice_per_sample = (2. * intersection + 1e-6) / (union_sum + 1e-6)
+        return tf.reduce_mean(dice_per_sample)
 
     def validate(self, val_dataset):
-        student_dice_scores = []
-        teacher_dice_scores = []
-        
+        dice_scores = []; total_loss = []; count = 0
+        if val_dataset is None: return 0.0, 0.0 # Return avg_loss, avg_dice
         for images, labels in val_dataset:
-            student_logits = self.student_model(images, training=False)
-            teacher_logits = self.teacher_model(images, training=False) # Teacher is EMA
-            
-            student_dice = self._compute_dice_metric(labels, student_logits)
-            teacher_dice = self._compute_dice_metric(labels, teacher_logits)
-            
-            if not tf.math.is_nan(student_dice): student_dice_scores.append(student_dice.numpy())
-            if not tf.math.is_nan(teacher_dice): teacher_dice_scores.append(teacher_dice.numpy())
-        
-        avg_student_dice = np.mean(student_dice_scores) if student_dice_scores else 0.0
-        avg_teacher_dice = np.mean(teacher_dice_scores) if teacher_dice_scores else 0.0
-        return avg_student_dice, avg_teacher_dice
+            logits = self.model(images, training=False)
+            # For validation loss, use the supervised loss component
+            loss = self.supervised_loss_fn(labels, logits) 
+            dice = self._compute_dice_metric(labels, logits)
+            if not tf.math.is_nan(dice): dice_scores.append(dice.numpy())
+            if not tf.math.is_nan(loss): total_loss.append(loss.numpy())
+            count +=1
+        avg_dice = np.mean(dice_scores) if dice_scores else 0.0
+        avg_loss = np.mean(total_loss) if total_loss else 0.0 # Can add val_loss to history
+        return avg_dice # Only returning dice for now to match existing history structure
 
-    def train(self, data_paths, num_epochs, steps_per_epoch=None): # Add steps_per_epoch
-        print("\nStarting MixMatch training...")
-        
-        train_ds_l = self.data_pipeline.build_labeled_dataset(
-            data_paths['labeled']['images'], data_paths['labeled']['labels'],
-            self.config.batch_size, is_training=True
-        ).repeat().prefetch(tf.data.AUTOTUNE)
+    def train(self, data_paths, num_epochs, steps_per_epoch=None):
+        tf.print(f"\nStarting MixMatch training for {num_epochs} epochs...")
+        train_ds_l = self.data_pipeline.build_labeled_dataset(data_paths['labeled']['images'], data_paths['labeled']['labels'], self.config.batch_size, True).prefetch(AUTOTUNE)
+        train_ds_u_raw = self.data_pipeline.build_unlabeled_dataset_for_mixmatch(data_paths['unlabeled']['images'], self.config.batch_size, True).repeat().prefetch(AUTOTUNE)
+        val_ds = self.data_pipeline.build_validation_dataset(data_paths['validation']['images'], data_paths['validation']['labels'], self.config.batch_size).prefetch(AUTOTUNE)
 
-        train_ds_u = self.data_pipeline.build_unlabeled_dataset_for_mixmatch(
-            data_paths['unlabeled']['images'], self.config.batch_size, is_training=True
-        ).repeat().prefetch(tf.data.AUTOTUNE) # Repeat unlabeled data
-
-        val_ds = self.data_pipeline.build_validation_dataset(
-            data_paths['validation']['images'], data_paths['validation']['labels'],
-            self.config.batch_size
-        ).prefetch(tf.data.AUTOTUNE)
-        
         if steps_per_epoch is None:
-            # Try to determine from labeled dataset
-            cardinality_l = tf.data.experimental.cardinality(train_ds_l).numpy()
-            if cardinality_l > 0 and cardinality_l != tf.data.experimental.UNKNOWN_CARDINALITY:
-                steps_per_epoch = cardinality_l
-                print(f"Determined steps_per_epoch from labeled dataset: {steps_per_epoch}")
-            else:
-                # Fallback if cardinality is unknown (e.g., due to interleave)
-                # Estimate based on number of labeled image files and typical slices
-                # num_labeled_files = len(data_paths['labeled']['images'])
-                # avg_slices_per_file = 30 # Rough estimate
-                # steps_per_epoch = (num_labeled_files * avg_slices_per_file) // self.config.batch_size
-                steps_per_epoch = 100 # Default if still unknown
-                print(f"Warning: Labeled dataset cardinality unknown/zero. Using default steps_per_epoch: {steps_per_epoch}")
-        else:
-            print(f"Using provided steps_per_epoch: {steps_per_epoch}")
+            num_labeled_files = len(data_paths['labeled']['images']); num_labeled_samples = num_labeled_files 
+            if num_labeled_samples > 0: steps_per_epoch = (num_labeled_samples + self.config.batch_size -1)//self.config.batch_size
+            else: steps_per_epoch = 100 
+            tf.print(f"MixMatch using steps_per_epoch: {steps_per_epoch}")
 
-
-        train_iter_l = iter(train_ds_l)
-        train_iter_u = iter(train_ds_u)
+        train_iter_l = iter(train_ds_l.repeat()) # Repeat labeled too, to ensure enough data for steps_per_epoch
+        train_iter_u_raw = iter(train_ds_u_raw)
         
-        best_student_dice = 0.0
-        patience_counter = 0
+        best_val_dice = 0.0; patience_counter = 0
         early_stopping_patience = getattr(self.config, 'early_stopping_patience', 20)
+        csv_log_path = self.output_dir / "mixmatch_training_log.csv"
+        with open(csv_log_path, 'w') as f: f.write("epoch,total_loss,L_x,L_u,lambda_u,val_dice,learning_rate,time_epoch_s\n")
 
         for epoch in range(num_epochs):
             epoch_start_time = time.time()
-            
-            epoch_total_losses = []
-            epoch_sup_losses = []
-            epoch_cons_losses = []
-            
-            # Reset labeled iterator if it runs out within an epoch (if steps_per_epoch > #labeled_batches)
-            # This ensures we always have labeled data for each step.
-            # Note: If steps_per_epoch is less than actual labeled batches, some labeled data won't be seen.
-            
-            # Progress bar for steps within an epoch
-            progress_bar = tf.keras.utils.Progbar(steps_per_epoch,unit_name="step") # Corrected import for Progbar
-            
+            epoch_total_L, epoch_Lx, epoch_Lu, epoch_lambda_u = [], [], [], []
+            progbar = tf.keras.utils.Progbar(steps_per_epoch, unit_name='step', stateful_metrics=['total_L','L_x','L_u','lambda_u'])
             for step in range(steps_per_epoch):
-                try:
-                    labeled_batch = next(train_iter_l)
-                except tf.errors.OutOfRangeError: # Or StopIteration
-                    train_iter_l = iter(train_ds_l) # Reinitialize iterator
-                    labeled_batch = next(train_iter_l)
-                
-                unlabeled_batch_single_view = next(train_iter_u) # Unlabeled is repeated, so no OutOfRange expected
-                
-                metrics = self.train_step(labeled_batch, unlabeled_batch_single_view)
-                
-                epoch_total_losses.append(metrics['total_loss'].numpy())
-                epoch_sup_losses.append(metrics['supervised_loss'].numpy())
-                epoch_cons_losses.append(metrics['consistency_loss'].numpy())
-                progress_bar.update(step + 1, values=[("total_loss", metrics['total_loss']), ("sup_loss", metrics['supervised_loss']), ("cons_loss", metrics['consistency_loss'])])
+                labeled_batch = next(train_iter_l)
+                unlabeled_batch_raw = next(train_iter_u_raw)
+                metrics = self.train_step(labeled_batch, unlabeled_batch_raw)
+                epoch_total_L.append(metrics['total_loss'].numpy()); epoch_Lx.append(metrics['L_x'].numpy())
+                epoch_Lu.append(metrics['L_u'].numpy()); epoch_lambda_u.append(metrics['lambda_u'].numpy())
+                progbar.update(step + 1, values=[("T_L", metrics['total_loss']), ("L_x", metrics['L_x']), ("L_u", metrics['L_u']), ("l_u", metrics['lambda_u'])])
 
-            # --- End of Epoch ---
-            avg_total_loss = np.mean(epoch_total_losses)
-            avg_sup_loss = np.mean(epoch_sup_losses)
-            avg_cons_loss = np.mean(epoch_cons_losses)
-            current_lr = self.lr_schedule(self.optimizer.iterations).numpy() # Get current LR
-
-            # Validation
-            val_student_dice, val_teacher_dice = self.validate(val_ds)
+            val_dice_epoch = self.validate(val_ds)
+            #current_lr_epoch = self.lr_schedule(self.optimizer.iterations).numpy()
+            current_lr_val = self.lr_schedule(self.optimizer.iterations)
+            current_lr_epoch = current_lr_val.numpy()
+            self.history['epoch'].append(epoch + 1); self.history['total_loss'].append(np.mean(epoch_total_L))
+            self.history['L_x'].append(np.mean(epoch_Lx)); self.history['L_u'].append(np.mean(epoch_Lu))
+            self.history['lambda_u'].append(np.mean(epoch_lambda_u)); self.history['val_dice'].append(val_dice_epoch)
+            self.history['learning_rate'].append(current_lr_epoch)
             
-            # Update history
-            self.history['epoch'].append(epoch + 1)
-            self.history['total_loss'].append(avg_total_loss)
-            self.history['supervised_loss'].append(avg_sup_loss)
-            self.history['consistency_loss'].append(avg_cons_loss)
-            self.history['val_student_dice'].append(val_student_dice)
-            self.history['val_teacher_dice'].append(val_teacher_dice)
-            self.history['learning_rate'].append(current_lr)
-            
-            epoch_time_taken = time.time() - epoch_start_time
-            print(f"\nEpoch {epoch+1}/{num_epochs} - Time: {epoch_time_taken:.2f}s - LR: {current_lr:.3e}")
-            print(f"  Losses: Total={avg_total_loss:.4f}, Sup={avg_sup_loss:.4f}, Cons={avg_cons_loss:.4f}")
-            print(f"  Val Dice: Student={val_student_dice:.4f}, Teacher={val_teacher_dice:.4f}")
+            epoch_time = time.time() - epoch_start_time
+            tf.print(f"\nE{epoch+1}/{num_epochs}-T:{epoch_time:.1f}s-LR:{current_lr_epoch:.2e} Loss:T={self.history['total_loss'][-1]:.3f},X={self.history['L_x'][-1]:.3f},U={self.history['L_u'][-1]:.3f}(w={self.history['lambda_u'][-1]:.2f}) ValDice:{val_dice_epoch:.4f}")
+            with open(csv_log_path, 'a') as f: f.write(f"{epoch+1},{self.history['total_loss'][-1]:.6f},{self.history['L_x'][-1]:.6f},{self.history['L_u'][-1]:.6f},{self.history['lambda_u'][-1]:.4f},{val_dice_epoch:.6f},{current_lr_epoch:.8e},{epoch_time:.2f}\n")
 
-            # Save best model based on student validation dice
-            if val_student_dice > best_student_dice:
-                best_student_dice = val_student_dice
-                self.save_checkpoint('best_mixmatch_model')
-                print(f"  ✓ New best student validation Dice: {best_student_dice:.4f}. Checkpoint saved.")
-                patience_counter = 0
-            else:
-                patience_counter += 1
+            if val_dice_epoch > best_val_dice:
+                best_val_dice = val_dice_epoch; self.save_checkpoint('best_mixmatch_model_student'); 
+                tf.print(f"  ✓ Best val Dice: {best_val_dice:.4f}. Checkpoint saved."); patience_counter = 0
+            else: patience_counter += 1
             
-            if (epoch + 1) % 5 == 0 or epoch == num_epochs - 1: # Plot every 5 epochs or last epoch
-                self.plot_progress(epoch + 1)
-
-            if patience_counter >= early_stopping_patience:
-                print(f"\nEarly stopping triggered after {epoch+1} epochs due to no improvement in student validation Dice for {early_stopping_patience} epochs.")
-                break
+            if (epoch+1)%5==0 or epoch==num_epochs-1 or patience_counter>=early_stopping_patience: self.plot_progress(epoch+1, final_plot=(epoch==num_epochs-1 or patience_counter>=early_stopping_patience))
+            if patience_counter >= early_stopping_patience: tf.print(f"\nEarly stopping at epoch {epoch+1}."); break
         
-        print(f"\nTraining completed! Best student validation Dice: {best_student_dice:.4f}")
-        # Save final model
-        self.save_checkpoint('final_mixmatch_model')
-        self.plot_progress(num_epochs, final_plot=True) # Final plot
-        
-        # Save history to CSV
-        history_df = pd.DataFrame(self.history)
-        history_df.to_csv(self.output_dir / 'mixmatch_training_history.csv', index=False)
-        print(f"Training history saved to {self.output_dir / 'mixmatch_training_history.csv'}")
-        
+        tf.print(f"\nMixMatch Training complete! Best val Dice: {best_val_dice:.4f}")
+        self.save_checkpoint('final_mixmatch_model_student')
         return self.history
 
     def save_checkpoint(self, name_prefix):
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        
-        student_model_path = self.checkpoint_dir / f'{name_prefix}_student_{timestamp}.weights.h5'
-        teacher_model_path = self.checkpoint_dir / f'{name_prefix}_teacher_{timestamp}.weights.h5'
-        
-        self.student_model.save_weights(str(student_model_path))
-        self.teacher_model.save_weights(str(teacher_model_path)) # Save teacher EMA weights
-        print(f"Saved checkpoint: Student to {student_model_path}, Teacher to {teacher_model_path}")
+        model_path = self.checkpoint_dir / f'{name_prefix}_{time.strftime("%Y%m%d_%H%M%S")}.weights.h5'
+        self.model.save_weights(str(model_path))
+        tf.print(f"Saved MixMatch model checkpoint to {model_path}")
 
-    def plot_progress(self, epoch_num, final_plot=False):
-        if not self.history['epoch']: return # Nothing to plot
-
-        plt.style.use('seaborn-v0_8-whitegrid') # Using a seaborn style
-        fig, axes = plt.subplots(2, 2, figsize=(18, 12))
-        fig.suptitle(f'MixMatch Training Progress - Epoch {epoch_num} - {self.experiment_name}', fontsize=16)
-
-        ax = axes[0, 0]
-        ax.plot(self.history['epoch'], self.history['total_loss'], label='Total Loss', color='red', marker='o', linestyle='-')
-        ax.plot(self.history['epoch'], self.history['supervised_loss'], label='Supervised Loss', color='blue', marker='x', linestyle='--')
-        ax.plot(self.history['epoch'], self.history['consistency_loss'], label='Consistency Loss', color='green', marker='s', linestyle=':')
-        ax.set_title('Training Losses')
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Loss')
-        ax.legend()
-        ax.grid(True, linestyle='--', alpha=0.7)
-
-        ax = axes[0, 1]
-        ax.plot(self.history['epoch'], self.history['val_student_dice'], label='Student Val Dice', color='purple', marker='o')
-        ax.plot(self.history['epoch'], self.history['val_teacher_dice'], label='Teacher Val Dice', color='orange', marker='x', linestyle='--')
-        ax.set_title('Validation Dice Scores')
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Dice Score')
-        ax.set_ylim(0, 1.05) # Dice score range
-        ax.legend()
-        ax.grid(True, linestyle='--', alpha=0.7)
-        
-        ax = axes[1, 0]
-        ax.plot(self.history['epoch'], self.history['learning_rate'], label='Learning Rate', color='teal', marker='.')
-        ax.set_title('Learning Rate')
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('LR Value')
-        ax.set_yscale('log') # Often useful for LR
-        ax.legend()
-        ax.grid(True, linestyle='--', alpha=0.7)
-
-        # Placeholder for consistency weight if you decide to log it directly
-        # Or remove this subplot if not logging consistency_weight_val from train_step's output dict
-        if 'consistency_weight' in self.history and self.history['consistency_weight']:
-             ax = axes[1, 1]
-             ax.plot(self.history['epoch'], self.history['consistency_weight'], label='Consistency Weight ($\lambda_u$)', color='brown', marker='^')
-             ax.set_title('Consistency Weight')
-             ax.set_xlabel('Epoch')
-             ax.set_ylabel('Weight Value')
-             ax.legend()
-             ax.grid(True, linestyle='--', alpha=0.7)
-        else:
-            fig.delaxes(axes[1,1]) # Remove empty subplot
-
-
-        plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust for suptitle
-        
-        plot_filename = 'final_training_summary.png' if final_plot else f'training_progress_epoch_{epoch_num}.png'
-        plt.savefig(self.plot_dir / plot_filename, dpi=150) # Slightly lower DPI for faster saving during training
-        plt.close(fig)
-        print(f"Saved progress plot: {self.plot_dir / plot_filename}")
+    def plot_progress(self, current_epoch_num, final_plot=False):
+        # ... (Plotting logic from before, ensure it uses self.history keys correctly) ...
+        if not self.history['epoch']: return
+        plt.style.use('seaborn-v0_8-whitegrid'); fig, axes = plt.subplots(2,2,figsize=(18,10))
+        fig.suptitle(f'MixMatch: {self.experiment_name} - Epoch {current_epoch_num}', fontsize=16)
+        ep = self.history['epoch']
+        ax=axes[0,0]; ax.plot(ep,self.history['total_loss'],label='Total',c='r'); ax.plot(ep,self.history['L_x'],label='L_x',c='b',ls='--'); ax.plot(ep,self.history['L_u'],label='L_u',c='g',ls=':'); ax.set_title('Losses'); ax.legend(); ax.grid(True)
+        ax=axes[0,1]; ax.plot(ep,self.history['val_dice'],label='Val Dice',c='purple'); ax.set_title('Val Dice'); ax.set_ylim(0,1.05); ax.legend(); ax.grid(True)
+        ax=axes[1,0]; ax.plot(ep,self.history['lambda_u'],label='$\lambda_u$',c='brown'); ax.set_title('Cons. Weight'); ax.legend(); ax.grid(True)
+        ax=axes[1,1]; ax.plot(ep,self.history['learning_rate'],label='LR',c='teal'); ax.set_title('Learning Rate'); ax.set_yscale('log'); ax.legend(); ax.grid(True)
+        plt.tight_layout(rect=[0,0,1,0.95])
+        fn=f"{'final' if final_plot else f'epoch_{current_epoch_num}'}_mixmatch_curves.png"
+        plt.savefig(self.plots_dir/fn); plt.close(fig); tf.print(f"Saved plot: {self.plots_dir/fn}")

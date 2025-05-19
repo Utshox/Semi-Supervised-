@@ -1,4 +1,4 @@
-#!/usr.bin/env python3
+#!/usr/bin/env python3
 import argparse
 import sys
 from pathlib import Path
@@ -6,198 +6,137 @@ import random
 import time
 import numpy as np
 import tensorflow as tf
-import pandas as pd # For saving history
+import matplotlib.pyplot as plt # In case you want to plot at the end from main
+import pandas as pd
 
-# Assuming these are in the same directory or accessible via PYTHONPATH
-from config import ExperimentConfig, StableSSLConfig
+# Assuming these modules are in the same directory or Python path
+from config import ExperimentConfig, StableSSLConfig # Make sure StableSSLConfig has MixMatch params
 from data_loader_tf2 import DataPipeline
-# PancreasSeg model is in models_tf2.py, MixMatchTrainer is in train_ssl_tf2n.py
-from train_ssl_tf2n import MixMatchTrainer # Ensure PancreasSeg is imported within train_ssl_tf2n or models_tf2
+# PancreasSeg is used by MixMatchTrainer
+from train_ssl_tf2n import MixMatchTrainer # Import your MixMatchTrainer
+from run_mean_teacher_v2 import prepare_data_paths 
 
-# --- Helper to prepare data paths (simplified from run_mean_teacher_v2.py) ---
-def prepare_data_paths_for_ssl(data_dir_str: str, num_labeled_patients: int, num_validation_patients: int, seed: int = 42):
-    data_dir = Path(data_dir_str)
-    all_patient_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir() and p.name.startswith("pancreas_")])
-    
-    if not all_patient_dirs:
-        raise FileNotFoundError(f"No patient directories found in {data_dir_str} matching 'pancreas_*'. Check --data_dir and preprocessed data.")
 
-    random.seed(seed)
-    random.shuffle(all_patient_dirs)
+AUTOTUNE = tf.data.experimental.AUTOTUNE
 
-    if len(all_patient_dirs) < num_labeled_patients + num_validation_patients:
-        raise ValueError(
-            f"Not enough patient data ({len(all_patient_dirs)}) for the specified splits: "
-            f"{num_labeled_patients} labeled, {num_validation_patients} validation. Need at least {num_labeled_patients + num_validation_patients} total."
-        )
+def main(args):
+    # --- GPU SETUP (Same as run_mean_teacher_v2.py) ---
+    gpus_for_setup = tf.config.experimental.list_physical_devices('GPU')
+    if gpus_for_setup:
+        try:
+            for gpu_setup in gpus_for_setup:
+                tf.config.experimental.set_memory_growth(gpu_setup, True)
+            print(f"SUCCESS: Set memory growth for {len(gpus_for_setup)} GPU(s).")
+        except RuntimeError as e_setup:
+            print(f"ERROR setting memory growth: {e_setup}", file=sys.stderr)
+    else:
+        print("No GPUs found by TensorFlow for memory growth setup.")
 
-    validation_patient_dirs = all_patient_dirs[:num_validation_patients]
-    remaining_patient_dirs = all_patient_dirs[num_validation_patients:]
-    
-    labeled_patient_dirs = remaining_patient_dirs[:num_labeled_patients]
-    # All remaining data after labeled and validation becomes unlabeled
-    unlabeled_patient_dirs = remaining_patient_dirs[num_labeled_patients:] 
 
-    print(f"Data Split: Total patient dirs: {len(all_patient_dirs)}, "
-          f"Labeled: {len(labeled_patient_dirs)}, "
-          f"Unlabeled: {len(unlabeled_patient_dirs)}, "
-          f"Validation: {len(validation_patient_dirs)}")
+    # 1. Setup Configuration
+    # output_dir_root is passed from shell, experiment_name is also from shell
+    exp_config_obj = ExperimentConfig(
+        experiment_name=args.experiment_name, # This will be the full name with params and date
+        experiment_type='semi-supervised-mixmatch',
+        results_dir=Path(args.output_dir) # This is OUTPUT_DIR_ROOT from shell
+    )
+    # The MixMatchTrainer will create its own experiment_name subdir within this Path(args.output_dir)
+    # So, exp_config_obj.results_dir is actually the base for where trainer saves.
+    # Let's adjust how MixMatchTrainer forms its output_dir or how we pass it.
+    # For now, let MixMatchTrainer handle creating its own subfolder.
 
-    def get_file_paths_from_patient_dirs(patient_dirs_list, is_labeled_data=True):
-        image_paths = []
-        label_paths = [] if is_labeled_data else None # Unlabeled data doesn't have label_paths
-        
-        for p_dir in patient_dirs_list:
-            img_file = p_dir / "image.npy"
-            mask_file = p_dir / "mask.npy" # Only relevant if is_labeled_data is True
-            
-            if img_file.exists():
-                if is_labeled_data: # For labeled and validation sets
-                    if mask_file.exists():
-                        image_paths.append(str(img_file))
-                        label_paths.append(str(mask_file))
-                    else:
-                        print(f"Warning: Missing mask.npy in {p_dir} for a supposedly labeled/validation patient. Skipping.", file=sys.stderr)
-                else: # For unlabeled set, only image is needed
-                    image_paths.append(str(img_file))
-            else:
-                print(f"Warning: Missing image.npy in {p_dir}. Skipping.", file=sys.stderr)
-                
-        return (image_paths, label_paths) if is_labeled_data else image_paths # Return only image_paths for unlabeled
-
-    labeled_images, labeled_labels = get_file_paths_from_patient_dirs(labeled_patient_dirs, is_labeled_data=True)
-    # For unlabeled data, we only need image paths.
-    unlabeled_images = get_file_paths_from_patient_dirs(unlabeled_patient_dirs, is_labeled_data=False)
-    validation_images, validation_labels = get_file_paths_from_patient_dirs(validation_patient_dirs, is_labeled_data=True)
-    
-    if not labeled_images: print("CRITICAL WARNING: No Labeled image paths found after filtering.", file=sys.stderr)
-    if not unlabeled_images and len(unlabeled_patient_dirs) > 0 : print("WARNING: Unlabeled patient dirs were selected, but no valid image.npy files found in them.", file=sys.stderr)
-    elif not unlabeled_images: print("INFO: No Unlabeled image paths found (this might be expected if num_labeled + num_validation covers all data).", file=sys.stderr)
-    if not validation_images: print("CRITICAL WARNING: No Validation image paths found after filtering.", file=sys.stderr)
-
-    return {
-        'labeled': {'images': labeled_images, 'labels': labeled_labels},
-        'unlabeled': {'images': unlabeled_images}, # Only 'images' key for unlabeled
-        'validation': {'images': validation_images, 'labels': validation_labels}
-    }
-
-def main_mixmatch(args):
-    # --- Setup Experiment Config ---
-    # ExperimentConfig is for overall experiment directory management, not trainer's internal output_dir
-    # The MixMatchTrainer itself will create subdirectories within args.output_dir / args.experiment_name
-
-    # --- Setup Model and Data Config (StableSSLConfig) ---
     model_data_config = StableSSLConfig(
-        img_size_x=args.img_size, 
-        img_size_y=args.img_size,
-        num_channels=1, 
-        num_classes=1, # Binary segmentation (pancreas vs background)
-        batch_size=args.batch_size,
-        # Pass MixMatch specific HPs to StableSSLConfig so MixMatchTrainer can access them
+        img_size_x=args.img_size, img_size_y=args.img_size,
+        num_channels=1, num_classes=1, # Binary segmentation
+        batch_size=args.batch_size, 
+        dropout_rate=args.dropout_rate,
+        learning_rate=args.learning_rate, # For MixMatchTrainer's optimizer
+        # MixMatch specific params from args, to be put into config
         mixmatch_T = args.mixmatch_T,
         mixmatch_K = args.mixmatch_K,
         mixmatch_alpha = args.mixmatch_alpha,
-        mixmatch_consistency_max = args.consistency_max,
-        mixmatch_rampup_steps = args.consistency_rampup_steps, # Rampup in steps
-        learning_rate = args.learning_rate, # For optimizer
-        ema_decay = args.ema_decay, # For teacher EMA final decay
-        initial_ema_decay = args.initial_teacher_ema_decay, # For teacher EMA initial decay
-        ema_warmup_steps = args.teacher_ema_warmup_steps, # Steps for EMA decay rampup
-        early_stopping_patience = args.early_stopping_patience,
-        output_dir = args.output_dir, # Base output dir for experiments
-        experiment_name = args.experiment_name # Specific experiment name
+        mixmatch_consistency_max = args.mixmatch_consistency_max,
+        mixmatch_rampup_steps = args.mixmatch_rampup_steps,
+        # EMA params for MixMatch if its trainer uses them (current one doesn't use these EMA specific from config)
+        # initial_ema_decay = args.initial_ema_decay
+        # ema_decay = args.ema_decay 
+        # ema_warmup_steps = args.ema_warmup_steps
+        output_dir = args.output_dir, # Pass the root output dir
+        experiment_name = args.experiment_name # Pass the unique experiment name
     )
-    model_data_config.checkpoint_dir = Path(args.output_dir) / args.experiment_name / "trainer_checkpoints" # Override
-    model_data_config.log_dir = Path(args.output_dir) / args.experiment_name / "trainer_logs" # Override
+    if not hasattr(model_data_config, 'n_filters'): model_data_config.n_filters = 32
 
-    # --- GPU Setup ---
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"Using {len(gpus)} GPU(s). TensorFlow version: {tf.__version__}")
-        except RuntimeError as e:
-            print(f"GPU Error: {e}", file=sys.stderr)
-    else:
-        print("No GPU found. Using CPU.", file=sys.stderr)
 
-    # --- Prepare Data Paths ---
-    print("Preparing data paths...")
-    data_paths = prepare_data_paths_for_ssl(args.data_dir, args.num_labeled, args.num_validation, args.seed)
+    tf.print("Preparing data paths for MixMatch...")
+    # MixMatch also needs labeled, unlabeled, validation
+    # num_labeled from args will define the split for training
+    data_paths = prepare_data_paths(args.data_dir, args.num_labeled, args.num_validation, args.seed)
+
+    # Instantiate MixMatch Trainer
+    # The trainer will create its own output subdirectories based on config.output_dir and config.experiment_name
+    mixmatch_trainer = MixMatchTrainer(config=model_data_config)
+
+    # Train
+    # The train method in MixMatchTrainer needs num_epochs and optionally steps_per_epoch
+    tf.print(f"--- Starting MixMatch Training ({args.num_epochs} epochs) ---")
     
-    if not data_paths['labeled']['images'] or not data_paths['validation']['images']:
-        sys.exit("CRITICAL ERROR: Labeled or Validation data paths are empty. Check data preparation and paths.")
-    if not data_paths['unlabeled']['images']:
-        print("WARNING: No unlabeled data found. MixMatch might not perform as expected without unlabeled samples.", file=sys.stderr)
-        # Potentially exit or allow to continue if this is an intended test
-        # sys.exit("CRITICAL ERROR: Unlabeled data paths are empty. MixMatch requires unlabeled data.")
-
-
-    # --- Initialize Trainer ---
-    # The MixMatchTrainer's __init__ will use model_data_config to set up its internal paths
-    trainer = MixMatchTrainer(config=model_data_config)
-
-    # --- Start Training ---
-    print(f"--- Starting MixMatch Training ({args.num_epochs} epochs) ---")
-    start_time_train = time.time()
+    # Calculate steps_per_epoch for MixMatch
+    # This is typically based on the number of labeled examples
+    num_labeled_files = len(data_paths['labeled']['images'])
+    # Assuming each .npy file yields 1 slice for this calculation, as per your data structure
+    num_labeled_samples_total = num_labeled_files 
+    if num_labeled_samples_total == 0 and args.num_labeled > 0:
+        tf.print("CRITICAL ERROR: No labeled files found for MixMatch training despite num_labeled > 0. Check data_paths.", output_stream=sys.stderr)
+        sys.exit(1)
     
-    # The train method in MixMatchTrainer will handle its own history and plotting
-    # It needs num_epochs and optionally steps_per_epoch
-    trainer.train(data_paths, num_epochs=args.num_epochs, steps_per_epoch=args.steps_per_epoch) 
+    calculated_steps_per_epoch = 100 # Default if no labeled data (should not happen)
+    if num_labeled_samples_total > 0 :
+        calculated_steps_per_epoch = (num_labeled_samples_total + args.batch_size - 1) // args.batch_size
     
-    end_time_train = time.time()
-    print(f"MixMatch training completed in {(end_time_train - start_time_train)/3600:.2f} hours.")
-    print(f"All results, checkpoints, and logs saved in: {trainer.output_dir}")
+    tf.print(f"MixMatch using steps_per_epoch: {calculated_steps_per_epoch} (based on {num_labeled_samples_total} labeled items)")
+
+    mixmatch_history = mixmatch_trainer.train(
+        data_paths=data_paths,
+        num_epochs=args.num_epochs,
+        steps_per_epoch=calculated_steps_per_epoch # Pass calculated steps
+    )
+    
+    tf.print(f"MixMatch training completed.")
+    tf.print(f"Results, checkpoints, and plots saved in: {mixmatch_trainer.output_dir}")
+
+    # Final plot (MixMatchTrainer's train method already calls plot_progress)
+    # mixmatch_trainer.plot_progress(args.num_epochs, final_plot=True)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run MixMatch training for pancreas segmentation.")
-    # Data and Output
-    parser.add_argument("--data_dir", type=str, required=True, help="Path to preprocessed data directory (containing patient_*/image.npy and mask.npy).")
-    parser.add_argument("--output_dir", type=str, default="./mixmatch_experiments", help="Base directory to save experiment results.")
-    parser.add_argument("--experiment_name", type=str, default=f"MixMatch_L{0}_Time{time.strftime('%Y%m%d_%H%M%S')}", help="Specific name for this experiment run.")
-    
-    # Data Split
-    parser.add_argument("--num_labeled", type=int, default=30, help="Number of labeled patient volumes for training.")
-    parser.add_argument("--num_validation", type=int, default=10, help="Number of patient volumes for validation.")
-    
-    # Training Generic HPs
-    parser.add_argument("--img_size", type=int, default=256, help="Target image size (height and width).")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.")
-    parser.add_argument("--num_epochs", type=int, default=150, help="Number of epochs for MixMatch training.")
-    parser.add_argument("--steps_per_epoch", type=int, default=None, help="Number of steps per epoch. If None, estimated from labeled data.")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Initial learning rate for Adam optimizer.")
-    parser.add_argument("--early_stopping_patience", type=int, default=25, help="Patience for early stopping.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser = argparse.ArgumentParser(description="Run MixMatch for pancreas segmentation.")
+    # Common arguments
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="./MixMatch_Experiments_Root", help="Root directory for all MixMatch experiment outputs.")
+    parser.add_argument("--experiment_name", type=str, default=f"MixMatchRun_{time.strftime('%Y%m%d_%H%M%S')}", help="Specific name for this experiment run.")
+    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--num_labeled", type=int, default=30, help="Number of labeled patient volumes/files for training.")
+    parser.add_argument("--num_validation", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=4) # MixMatch often uses larger batches if possible
+    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--learning_rate", type=float, default=0.002) # MixMatch often uses higher LR with schedulers
+    parser.add_argument("--dropout_rate", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--verbose", type=int, default=1, choices=[0,1,2]) # For Keras Progbar in trainer
+    parser.add_argument("--early_stopping_patience", type=int, default=30)
 
-    # MixMatch Specific HPs
+
+    # MixMatch specific arguments
     parser.add_argument("--mixmatch_T", type=float, default=0.5, help="Temperature for sharpening pseudo-labels.")
-    parser.add_argument("--mixmatch_K", type=int, default=2, help="Number of augmentations for generating pseudo-labels.")
+    parser.add_argument("--mixmatch_K", type=int, default=2, help="Number of augmentations for guessing pseudo-labels.")
     parser.add_argument("--mixmatch_alpha", type=float, default=0.75, help="Alpha parameter for Beta distribution in MixUp.")
-    parser.add_argument("--consistency_max", type=float, default=10.0, help="Maximum weight for the consistency loss.")
-    parser.add_argument("--consistency_rampup_steps", type=int, default=5000, help="Number of training steps for consistency weight to ramp up to max_consistency_weight.") # Changed from epochs to steps
-
-    # Teacher EMA HPs
-    parser.add_argument("--initial_teacher_ema_decay", type=float, default=0.95, help="Initial EMA decay for teacher model during its warmup phase.")
-    parser.add_argument("--ema_decay", type=float, default=0.999, help="Final (base) EMA decay for updating teacher model.")
-    parser.add_argument("--teacher_ema_warmup_steps", type=int, default=2000, help="Number of training steps for teacher EMA decay to ramp up to base_ema_decay.") # Changed from epochs to steps
+    parser.add_argument("--mixmatch_consistency_max", type=float, default=100.0, help="Max weight for unlabeled consistency loss.")
+    parser.add_argument("--mixmatch_rampup_steps", type=int, default=10000, help="Number of training steps for lambda_u ramp-up (e.g. 16 epochs * 700 steps/epoch).")
     
-    parser.add_argument("--verbose", type=int, default=1, choices=[0,1,2], help="Verbosity level for training.") # Keras verbose
-
     args = parser.parse_args()
-
-    # Update experiment name if L0 was default
-    if f"L{0}" in args.experiment_name:
-         args.experiment_name = f"MixMatch_L{args.num_labeled}_Time{time.strftime('%Y%m%d_%H%M%S')}"
-
-    # Set random seeds
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    tf.random.set_seed(args.seed)
     
-    print("Arguments received:")
-    for arg, value in sorted(vars(args).items()):
-        print(f"  {arg}: {value}")
-    
-    main_mixmatch(args)
+    # Update experiment name to include key parameters dynamically AFTER parsing args
+    args.experiment_name = f"MixMatch_L{args.num_labeled}_B{args.batch_size}_K{args.mixmatch_K}_Alpha{args.mixmatch_alpha}_Temp{args.mixmatch_T}_ConsMax{args.mixmatch_consistency_max}_{time.strftime('%Y%m%d_%H%M%S')}"
+
+    random.seed(args.seed); np.random.seed(args.seed); tf.random.set_seed(args.seed)
+    main(args)

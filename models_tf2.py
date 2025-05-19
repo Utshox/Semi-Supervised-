@@ -1,5 +1,6 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
+import sys
 import numpy as np # Not strictly needed for these model definitions but often useful in the file
 
 class UNetBlock(layers.Layer):
@@ -205,64 +206,67 @@ class PancreasSeg(Model):
 
 
 class CombinedLoss(tf.keras.losses.Loss):
-    def __init__(self, config, smooth=1e-6, alpha = 0.25, gamma = 2): # config might not be used here
-        super().__init__(name="combined_loss") # Added name
-        # self.config = config # config is not used in the methods below
+    def __init__(self, config=None, smooth=1e-6, alpha=0.25, gamma=2):
+        super().__init__(name="combined_loss")
         self.smooth = smooth
         self.alpha = alpha 
         self.gamma = gamma
+        # Instantiate BCE loss to control reduction
+        self.bce_for_focal = tf.keras.losses.BinaryCrossentropy(
+            from_logits=False, # focal_loss receives probabilities
+            reduction=tf.keras.losses.Reduction.NONE # Get per-element loss
+        )
 
-    def dice_loss(self, y_true, y_pred_probs): # Expects probabilities after sigmoid
+    def dice_loss(self, y_true, y_pred_probs): # Expects probabilities
           y_true_f = tf.cast(y_true, tf.float32)
           y_pred_probs_f = tf.cast(y_pred_probs, tf.float32)
-          
-          intersection = tf.reduce_sum(y_true_f * y_pred_probs_f, axis=[1, 2]) # Assuming H, W are axes 1, 2
-          union_sum = tf.reduce_sum(y_true_f, axis=[1, 2]) + tf.reduce_sum(y_pred_probs_f, axis=[1, 2])
-          
-          dice = (2. * intersection + self.smooth) / (union_sum + self.smooth)
-          return 1.0 - tf.reduce_mean(dice) # Average dice loss over batch
+          intersection = tf.reduce_sum(y_true_f * y_pred_probs_f, axis=[1, 2, 3]) 
+          union_sum = tf.reduce_sum(y_true_f, axis=[1, 2, 3]) + tf.reduce_sum(y_pred_probs_f, axis=[1, 2, 3])
+          dice_per_sample = (2. * intersection + self.smooth) / (union_sum + self.smooth)
+          return 1.0 - tf.reduce_mean(dice_per_sample)
 
-    def focal_loss(self, y_true, y_pred_probs): # Expects probabilities
-        y_true_f = tf.cast(y_true, tf.float32)
+    def focal_loss(self, y_true, y_pred_probs): # y_true and y_pred_probs are [B,H,W,1]
+        y_true_f = tf.cast(y_true, tf.float32) 
         y_pred_probs_f = tf.clip_by_value(tf.cast(y_pred_probs, tf.float32), 1e-7, 1.0 - 1e-7)
         
-        # For binary segmentation, pos_weight is often used for BCE, not directly in focal like this.
-        # Standard focal loss:
-        # BCE = -y_true * log(p_t) - (1-y_true) * log(1-p_t) where p_t is y_pred if y_true=1, else 1-y_pred
-        # FL = alpha_t * (1-p_t)^gamma * BCE
-        
-        # Simpler binary focal loss:
-        bce = tf.keras.losses.binary_crossentropy(y_true_f, y_pred_probs_f, from_logits=False) # from_logits=False because y_pred_probs_f are probs
-        
-        # Calculate p_t for focal weight
-        p_t = y_true_f * y_pred_probs_f + (1 - y_true_f) * (1 - y_pred_probs_f)
-        focal_modulator = tf.pow(1.0 - p_t, self.gamma)
-        
-        # Alpha weighting (alpha for positive class, 1-alpha for negative)
-        alpha_weight = y_true_f * self.alpha + (1 - y_true_f) * (1 - self.alpha)
-        
-        focal_loss = alpha_weight * focal_modulator * bce
-        return tf.reduce_mean(focal_loss) # Average over batch and pixels
+        # tf.print("DEBUG focal_loss input: y_true_f shape:", tf.shape(y_true_f), "y_pred_probs_f shape:", tf.shape(y_pred_probs_f), output_stream=sys.stderr)
 
-    def call(self, y_true, y_pred_logits): # Expects logits from model
-        # Assume y_true is [B, H, W, 1] and y_pred_logits is [B, H, W, 1] for binary
+        # Calculate BCE per pixel.
+        # self.bce_for_focal is BinaryCrossentropy(from_logits=False, reduction=Reduction.NONE)
+        # If y_true_f and y_pred_probs_f are [B,H,W,1], bce_output might be [B,H,W].
+        bce_output_maybe_squeezed = self.bce_for_focal(y_true_f, y_pred_probs_f)
         
-        # y_true should be [B,H,W,1] for binary segmentation if num_classes=1
-        # y_pred_logits should also be [B,H,W,1]
+        # tf.print("DEBUG focal_loss: bce_output_maybe_squeezed shape:", tf.shape(bce_output_maybe_squeezed), output_stream=sys.stderr)
+
+        # Ensure bce_per_pixel is [B,H,W,1] by adding a new axis if it was squeezed to [B,H,W]
+        if len(bce_output_maybe_squeezed.shape) == 3: # If shape is [B,H,W]
+            bce_per_pixel = bce_output_maybe_squeezed[..., tf.newaxis] # Add channel dim -> [B,H,W,1]
+        else: # Assume it's already [B,H,W,1] or some other error occurred
+            bce_per_pixel = bce_output_maybe_squeezed
         
-        # Your previous code sliced y_true[..., 1:] and y_pred[..., 1:].
-        # If num_classes=1, the last dimension is already 1, so slicing [..., 1:] would result in an empty tensor.
-        # Assuming for binary segmentation, y_true and y_pred_logits are already the correct single channel.
+        # tf.print("DEBUG focal_loss: bce_per_pixel (after potential expand) shape:", tf.shape(bce_per_pixel), output_stream=sys.stderr)
+
+        # p_t, focal_modulator, alpha_weight will be [B,H,W,1] because inputs are [B,H,W,1]
+        p_t = y_true_f * y_pred_probs_f + (1.0 - y_true_f) * (1.0 - y_pred_probs_f)
+        focal_modulator = tf.pow(1.0 - p_t, self.gamma)
+        alpha_weight = y_true_f * self.alpha + (1.0 - y_true_f) * (1.0 - self.alpha)
+        
+        # tf.print("DEBUG focal_loss FINAL shapes B4 mul:",
+        #          "\n  alpha_weight shape:", tf.shape(alpha_weight),         # Expected: [B,H,W,1]
+        #          "\n  focal_modulator shape:", tf.shape(focal_modulator),   # Expected: [B,H,W,1]
+        #          "\n  bce_per_pixel shape:", tf.shape(bce_per_pixel),       # Expected: [B,H,W,1]
+        #          output_stream=sys.stderr, summarize=-1)
+
+        focal_loss_elements = alpha_weight * focal_modulator * bce_per_pixel 
+        
+        return tf.reduce_mean(focal_loss_elements)
+
+    def call(self, y_true, y_pred_logits):
         y_true_processed = y_true
         y_pred_logits_processed = y_pred_logits
-
-        # Convert logits to probabilities for loss functions that expect them
         y_pred_probs_processed = tf.nn.sigmoid(y_pred_logits_processed)
-
         dice_l = self.dice_loss(y_true_processed, y_pred_probs_processed)
         focal_l = self.focal_loss(y_true_processed, y_pred_probs_processed)
-        
-        # Example weighting: (adjust as needed)
         return 0.5 * dice_l + 0.5 * focal_l
        
 class ContrastiveLoss(tf.keras.losses.Loss):

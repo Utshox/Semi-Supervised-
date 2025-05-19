@@ -9,11 +9,31 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 import pandas as pd
 
+# --- GPU MEMORY GROWTH SETUP ---
+# This needs to be one of THE FIRST TF operations
+gpus_for_setup = tf.config.experimental.list_physical_devices('GPU')
+if gpus_for_setup:
+    try:
+        for gpu_setup in gpus_for_setup:
+            tf.config.experimental.set_memory_growth(gpu_setup, True)
+        print(f"SUCCESS: Set memory growth for {len(gpus_for_setup)} GPU(s).") # Use print here
+    except RuntimeError as e_setup:
+        # Memory growth must be set before GPUs have been initialized
+        print(f"ERROR setting memory growth: {e_setup}", file=sys.stderr) # Use print here
+else:
+    print("No GPUs found by TensorFlow for memory growth setup.") # Use print here
+# --- END GPU MEMORY GROWTH SETUP ---
+
+
 # Assuming these modules are in the same directory or Python path
 from config import ExperimentConfig, StableSSLConfig
 from data_loader_tf2 import DataPipeline
 from models_tf2 import PancreasSeg # UNetBlock is used by PancreasSeg
 from train_ssl_tf2n import MeanTeacherTrainer # Ensure this has phased EMA and sharpening_temperature param
+
+# FOR DEBUGGING DATA PIPELINE / CALLBACKS / TF.FUNCTION ISSUES:
+tf.config.run_functions_eagerly(True)
+tf.print("INFO: TensorFlow is running functions EAGERLY for debugging.")
 
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 # --- Define Custom Loss and Metric ---
@@ -69,6 +89,67 @@ class DiceCoefficient(tf.keras.metrics.Metric):
 class MTPhaseEpochUpdater(tf.keras.callbacks.Callback): # For Phased EMA
     def on_epoch_begin(self, epoch, logs=None):
         self.model.mt_phase_current_epoch.assign(epoch)
+
+class TeacherDirectCopyCallback(tf.keras.callbacks.Callback):
+    def __init__(self, student_model_ref, direct_copy_epochs=0):
+        super().__init__()
+        self.student_model_ref = student_model_ref # Reference to the student model
+        self.direct_copy_epochs = direct_copy_epochs
+        print(f"DEBUG TeacherDirectCopyCallback: Initialized. Will copy for first {direct_copy_epochs} MT epochs.")
+        tf.print(f"TeacherDirectCopyCallback initialized: copy for first {direct_copy_epochs} MT epochs.")
+
+
+    def on_epoch_begin(self, epoch, logs=None): # epoch is 0-indexed for the current fit() call
+        if epoch < self.direct_copy_epochs:
+            tf.print(f"MT Epoch {epoch + 1}: DIRECT COPYING student weights to teacher (on_epoch_begin).")
+            self.model.teacher_model.set_weights(self.student_model_ref.get_weights())
+            # self.model here refers to the MeanTeacherTrainer instance
+            # --- BEGIN INTENSE DEBUGGING ---
+            try:
+                # Get student weights (list of NumPy arrays)
+                student_weights_list = self.student_model_ref.get_weights()
+                tf.print(f"  DEBUG DirectCopy: Successfully got {len(student_weights_list)} weight arrays from student_model_ref.", output_stream=sys.stderr)
+
+                # Get teacher's Keras variables (list of tf.Variable objects)
+                # Using .variables attribute is more direct for inspection here than .weights
+                teacher_keras_vars_list = self.model.teacher_model.variables 
+                tf.print(f"  DEBUG DirectCopy: Teacher model has {len(teacher_keras_vars_list)} variables (.variables).", output_stream=sys.stderr)
+                
+                # Also check .weights attribute for teacher, as set_weights uses this structure
+                teacher_keras_weights_attr_list = self.model.teacher_model.weights
+                tf.print(f"  DEBUG DirectCopy: Teacher model has {len(teacher_keras_weights_attr_list)} weights in .weights attr.", output_stream=sys.stderr)
+
+
+                if len(student_weights_list) != len(teacher_keras_weights_attr_list):
+                    tf.print(f"  CRITICAL DEBUG DirectCopy: MISMATCH in number of weight sets! Student: {len(student_weights_list)}, Teacher (.weights): {len(teacher_keras_weights_attr_list)}", output_stream=sys.stderr)
+                
+                # Print shapes for the first few to see the alignment
+                limit = min(len(student_weights_list), len(teacher_keras_weights_attr_list), 10)
+                for i in range(limit):
+                    s_shape = student_weights_list[i].shape
+                    t_var = teacher_keras_weights_attr_list[i] # This is a tf.Variable
+                    t_shape = t_var.shape
+                    is_match = "MATCH" if s_shape == t_shape else "MISMATCH"
+                    tf.print(f"    Idx {i}: Student NumPy Shape: {s_shape} <-> Teacher Var '{t_var.name}' Shape: {t_shape} [{is_match}]", output_stream=sys.stderr)
+                    if s_shape != t_shape:
+                        tf.print(f"      ----> MISMATCH WILL OCCUR HERE for {t_var.name}", output_stream=sys.stderr)
+                        # We can stop before the error to analyze
+                        # For now, let it try to set_weights to see the original error point.
+
+                tf.print(f"  DEBUG DirectCopy: Proceeding with set_weights...", output_stream=sys.stderr)
+                # This is the line that fails
+                self.model.teacher_model.set_weights(student_weights_list) 
+                tf.print(f"  DEBUG DirectCopy: set_weights call completed SUCCESSFULLY (this means error was somewhere else).", output_stream=sys.stderr)
+
+            except ValueError as ve: # Catch the specific ValueError
+                tf.print(f"  CRITICAL DEBUG DirectCopy: ValueError during set_weights: {ve}", output_stream=sys.stderr)
+                tf.print(f"    Failed when trying to set weights for teacher. Student weight list len: {len(student_weights_list) if student_weights_list is not None else 'N/A'}", output_stream=sys.stderr)
+                # Re-raise to see the original Keras/TF traceback too
+                raise ve 
+            except Exception as e:
+                tf.print(f"  CRITICAL DEBUG DirectCopy: General error: {type(e).__name__} - {e}", output_stream=sys.stderr)
+                raise e
+                # --- END INTENSE DEBUGGING ---        
 
 class ConsistencyWeightScheduler(tf.keras.callbacks.Callback):
     def __init__(self, consistency_weight_var, max_weight, rampup_epochs, delay_rampup_epochs=0):
@@ -223,17 +304,28 @@ def main(args):
         # If EarlyStopping restored_best_weights, pretrain_student_model has them.
 
     tf.print("Instantiating student and teacher models for Mean Teacher phase...")
-    student_model = PancreasSeg(model_data_config); teacher_model = PancreasSeg(model_data_config)
-    _ = student_model(tf.zeros((1,args.img_size,args.img_size,1))); _ = teacher_model(tf.zeros((1,args.img_size,args.img_size,1)))
+    student_model_mt = PancreasSeg(model_data_config); 
+    teacher_model_mt = PancreasSeg(model_data_config)
+    dummy_input = tf.zeros((1, args.img_size, args.img_size, model_data_config.num_channels))
+    _ = student_model_mt(dummy_input); _ = teacher_model_mt(dummy_input)
     if pretrain_student_model:
-        student_model.set_weights(pretrain_student_model.get_weights()); tf.print("Student model weights init from pre-trained.")
+        student_model_mt.set_weights(pretrain_student_model.get_weights()); 
+        tf.print("Student model weights init from pre-trained.")
         del pretrain_student_model
     else: tf.print("Student model weights init randomly.")
-    teacher_model.set_weights(student_model.get_weights()); tf.print("Teacher model weights init from student.")
+    
+    
+    teacher_model_mt.set_weights(student_model_mt.get_weights()); 
+    tf.print("Teacher model weights initialized from MT student model.")
 
     mean_teacher_trainer = MeanTeacherTrainer(
-        student_model, teacher_model, args.ema_decay, args.teacher_ema_warmup_epochs,
-        args.initial_teacher_ema_decay, args.sharpening_temperature)
+        student_model=student_model_mt, # Pass the correct student model instance
+        teacher_model=teacher_model_mt, # Pass the correct teacher model instance
+        ema_decay=args.ema_decay, # This is the base_ema_decay
+        #teacher_aggressive_ema_epochs=args.teacher_aggressive_ema_epochs,
+        #teacher_aggressive_ema_decay=args.initial_teacher_ema_decay, # Value for the aggressive phase
+        sharpening_temperature=args.sharpening_temperature
+    )
     mean_teacher_trainer.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate),
                                  loss=DiceBCELoss(), metrics=[DiceCoefficient(name='student_dice')])
     tf.print("MeanTeacherTrainer compiled for MT phase.")
@@ -255,8 +347,15 @@ def main(args):
     mt_checkpoint_filepath_tf = str(mt_checkpoint_dir / "best_mt_student_epoch_{epoch:02d}_val_dice_{val_student_dice:.4f}") # TF Format
 
     callbacks_mt = [
-        MTPhaseEpochUpdater(),
-        ConsistencyWeightScheduler(mean_teacher_trainer.consistency_weight, args.consistency_max, args.consistency_rampup, args.teacher_ema_warmup_epochs if args.delay_consistency_rampup else 0),
+        MTPhaseEpochUpdater(), # Sets mt_phase_current_epoch in trainer
+        TeacherDirectCopyCallback(student_model_mt, args.teacher_direct_copy_epochs), # NEW: for direct copy
+        ConsistencyWeightScheduler(
+            mean_teacher_trainer.consistency_weight, 
+            args.consistency_max, 
+            args.consistency_rampup, 
+            # Delay consistency rampup until AFTER direct copy phase AND initial EMA phase
+            delay_rampup_epochs=args.teacher_direct_copy_epochs if args.delay_consistency_rampup_by_copy_phase else 0
+        ),
         tf.keras.callbacks.ModelCheckpoint(filepath=mt_checkpoint_filepath_tf, save_weights_only=True, monitor='val_student_dice', mode='max', save_best_only=True, verbose=1),
         tf.keras.callbacks.TensorBoard(log_dir=str(exp_config.results_dir / "logs_mt"), histogram_freq=1),
         tf.keras.callbacks.CSVLogger(str(exp_config.results_dir / "mean_teacher_training_log.csv")),
@@ -269,36 +368,64 @@ def main(args):
     plot_training_summary(history_mt, exp_config.results_dir / "mean_teacher_training_log.csv", plots_dir, f"Mean Teacher ({args.num_labeled}L)")
     
     final_model_path_tf = exp_config.results_dir / "final_mt_student_model" # TF Format
-    student_model.save_weights(str(final_model_path_tf))
+    student_model_mt.save_weights(str(final_model_path_tf))
     tf.print(f"Final MT student model weights (TF format) saved to {final_model_path_tf}")
     tf.print(f"All results saved in: {exp_config.results_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Mean Teacher (MT) for pancreas segmentation.")
     parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="./experiment_results_mt")
-    parser.add_argument("--experiment_name", type=str, default=f"MT_Run_{time.strftime('%Y%m%d_%H%M%S')}")
+    parser.add_argument("--output_dir", type=str, default="./experiment_results_mt_final") # Changed default slightly
+    parser.add_argument("--experiment_name", type=str, default=f"MT_FinalRun_{time.strftime('%Y%m%d_%H%M%S')}")
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--num_labeled", type=int, default=30)
     parser.add_argument("--num_validation", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     
+    # Student Pre-training
     parser.add_argument("--student_pretrain_epochs", type=int, default=15, help="Epochs for supervised pre-training of student.")
     parser.add_argument("--dropout_rate", type=float, default=0.1, help="Dropout rate for models.")
     
-    parser.add_argument("--num_epochs", type=int, default=100, help="Epochs for MT training phase.")
+    # Mean Teacher (MT) Phase Epochs
+    parser.add_argument("--num_epochs", type=int, default=100, help="Epochs for the main MT training phase.")
+    
+    # Learning Rate for both Pre-training and MT phase (can be made separate if needed)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--teacher_ema_warmup_epochs", type=int, default=10, help="Initial MT epochs for faster teacher EMA.")
-    parser.add_argument("--initial_teacher_ema_decay", type=float, default=0.5, help="EMA decay for teacher during its warmup.")
-    parser.add_argument("--ema_decay", type=float, default=0.999, help="Base EMA decay for teacher after its warmup.")
-    parser.add_argument("--sharpening_temperature", type=float, default=0.5, help="Temperature for teacher prediction sharpening.")
-    parser.add_argument("--consistency_max", type=float, default=10.0)
-    parser.add_argument("--consistency_rampup", type=int, default=30, help="Duration of consistency weight ramp-up in MT phase.")
-    parser.add_argument("--delay_consistency_rampup", action='store_true', help="If set, delay consistency rampup until after teacher EMA warmup.")
-    parser.add_argument("--early_stopping_patience", type=int, default=25)
+    
+    # Teacher Update Strategy for MT Phase
+    parser.add_argument("--teacher_direct_copy_epochs", type=int, default=10, 
+                        help="Number of initial MT epochs where teacher is a direct copy of student (via callback).")
+    # The following two control an OPTIONAL aggressive EMA phase AFTER direct copy, BEFORE base EMA.
+    # If teacher_initial_ema_phase_epochs is 0, this phase is skipped.
+    parser.add_argument("--teacher_initial_ema_phase_epochs", type=int, default=0, 
+                        help="MT Epochs: After direct copy, use initial_teacher_ema_decay for this many epochs.")
+    
+    parser.add_argument("--initial_teacher_ema_decay", type=float, default=0.90, # Only used if teacher_initial_ema_phase_epochs > 0
+                        help="EMA decay for teacher during its 'initial aggressive EMA phase'.")
+    
+    # Base EMA decay (used after direct copy AND after initial aggressive EMA phase, if active)
+    parser.add_argument("--ema_decay", type=float, default=0.999, 
+                        help="Base EMA decay for teacher for the remainder of training.")
+    
+    # Consistency Loss and Sharpening
+    parser.add_argument("--sharpening_temperature", type=float, default=0.25, 
+                        help="Temperature for teacher prediction sharpening (lower is stronger).")
+    parser.add_argument("--consistency_max", type=float, default=20.0, # Increased from 10
+                        help="Maximum weight for the consistency loss.")
+    parser.add_argument("--consistency_rampup", type=int, default=40, # Increased rampup duration
+                        help="Duration (in MT epochs) of consistency weight ramp-up.")
+    parser.add_argument("--delay_consistency_rampup_by_copy_phase", action='store_true', 
+                        help="If set, delay consistency rampup until after teacher direct copy phase.")
+    # Note: The --delay_consistency_rampup_by_copy_phase is a simpler flag now.
+    # The ConsistencyWeightScheduler in run_mean_teacher_v2.py needs to use args.teacher_direct_copy_epochs
+    # if this flag is true.
+
+    # Other parameters
+    parser.add_argument("--early_stopping_patience", type=int, default=30) # Increased patience
     parser.add_argument("--verbose", type=int, default=1, choices=[0,1,2])
     parser.add_argument("--seed", type=int, default=42)
     
     args = parser.parse_args()
     random.seed(args.seed); np.random.seed(args.seed); tf.random.set_seed(args.seed)
     main(args)
+  
