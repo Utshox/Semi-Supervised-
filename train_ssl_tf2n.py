@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import tqdm
 from models_tf2 import *
+
 from data_loader_tf2 import DataPipeline, PancreasDataLoader
 from visualization import ExperimentVisualizer
 
@@ -742,26 +743,41 @@ class StableSSLTrainer:
 
 class MeanTeacherTrainer(tf.keras.Model):
     def __init__(self, student_model, teacher_model, 
-                 ema_decay, # This is the base_ema_decay
+                 ema_decay, # This is the base_ema_decay for per-batch EMA
                  sharpening_temperature=0.5,
-                 # No teacher_direct_copy_epochs needed here by __init__
+                 # This is passed from run_mean_teacher_v2.py args, used by test_step logic
+                 teacher_direct_copy_epochs_config=0, 
                  **kwargs):
         super().__init__(**kwargs)
         self.student_model = student_model
         self.teacher_model = teacher_model
+        
         self.base_ema_decay = tf.cast(ema_decay, tf.float32)
         self.sharpening_temperature = tf.constant(sharpening_temperature, dtype=tf.float32)
+        # Store the config for how many epochs test_step should force copy
+        self.teacher_direct_copy_epochs_config = tf.constant(teacher_direct_copy_epochs_config, dtype=tf.int32)
+        
         self.teacher_model.trainable = False
         self.consistency_weight = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="consistency_weight")
         self.consistency_loss_fn = tf.keras.losses.MeanSquaredError()
-        # mt_phase_current_epoch is still set by MTPhaseEpochUpdater in run_mean_teacher_v2.py
-        # It's used by ConsistencyWeightScheduler for delay.
         self.mt_phase_current_epoch = tf.Variable(-1, dtype=tf.int32, trainable=False, name="mt_phase_epoch_counter")
+        self.teacher_val_dice_metric = DiceCoefficient(name="teacher_val_dice_obj")
+ 
+ 
+    # --- ADD THIS CALL METHOD ---
+    def call(self, inputs, training=False, mask=None):
+        """
+        Defines the forward pass for the MeanTeacherTrainer model.
+        For evaluation or direct calls, this will return the student model's output.
+        """
+        # When MeanTeacherTrainer itself is called (e.g., by some Keras internals
+        # or if you did trainer_instance(inputs)), return the student's prediction.
+        return self.student_model(inputs, training=training)
+    # --- END ADDITION ---
 
-    def _update_teacher_model(self): # This is called per batch
-        # This method ONLY performs the standard EMA update using self.base_ema_decay.
-        # The TeacherDirectCopyCallback handles the initial direct copy at epoch_begin.
-        
+    def _update_teacher_model(self): 
+        # This method ALWAYS uses self.base_ema_decay for the per-batch EMA.
+        # The TeacherDirectCopyCallback in run_mean_teacher_v2.py handles the initial direct copy at on_epoch_begin.
         for s_var, t_var in zip(self.student_model.trainable_variables, self.teacher_model.trainable_variables):
             t_var.assign(self.base_ema_decay * t_var + (1.0 - self.base_ema_decay) * s_var)
         
@@ -769,9 +785,10 @@ class MeanTeacherTrainer(tf.keras.Model):
         teacher_all_weights = self.teacher_model.weights
         if len(student_all_weights) == len(teacher_all_weights):
             for s_w, t_w in zip(student_all_weights, teacher_all_weights):
-                if not t_w.trainable: # For non-trainable like BN moving_mean, moving_variance
+                if not t_w.trainable: 
                     if s_w.shape == t_w.shape: t_w.assign(s_w) 
-        return # No return value needed
+        # else:
+            # tf.print("ERROR _update_teacher_model BN: Student/Teacher weight count mismatch.", output_stream=sys.stderr)
             
     def _calculate_dice(self, y_true, y_pred_logits, smooth=1e-6):
         y_true_f = tf.cast(y_true, tf.float32)
@@ -783,7 +800,7 @@ class MeanTeacherTrainer(tf.keras.Model):
         dice_per_sample = (2. * intersection + smooth) / (sum_true + sum_pred + smooth)
         return tf.reduce_mean(dice_per_sample)
 
-    def compile(self, optimizer, loss, metrics=None, **kwargs): # Expects 'loss'
+    def compile(self, optimizer, loss, metrics=None, **kwargs):
         super().compile(optimizer=optimizer, loss=loss, metrics=metrics, **kwargs)
 
     @property
@@ -803,79 +820,139 @@ class MeanTeacherTrainer(tf.keras.Model):
             teacher_unlabeled_logits = self.teacher_model(unlabeled_teacher_input, training=False)
             
             raw_sharpened_logits = teacher_unlabeled_logits / self.sharpening_temperature
-            clipped_sharpened_logits = tf.clip_by_value(raw_sharpened_logits, -15.0, 15.0) # Clip range
+            safe_sharpened_logits = tf.where(tf.math.is_finite(raw_sharpened_logits), raw_sharpened_logits, tf.zeros_like(raw_sharpened_logits))
+            clipped_sharpened_logits = tf.clip_by_value(safe_sharpened_logits, -15.0, 15.0)
             sharpened_teacher_probs_for_consistency = tf.nn.sigmoid(clipped_sharpened_logits)
-
-            # sharpened_teacher_logits = teacher_unlabeled_logits / self.sharpening_temperature 
-            #sharpened_teacher_probs_for_consistency = tf.nn.sigmoid(sharpened_teacher_logits)
 
             student_unlabeled_probs = tf.nn.sigmoid(student_unlabeled_logits)
             consistency_loss_value = self.consistency_loss_fn(sharpened_teacher_probs_for_consistency, student_unlabeled_probs)
-            
             total_loss = supervised_loss + self.consistency_weight * consistency_loss_value
 
         gradients = tape.gradient(total_loss, self.student_model.trainable_variables)
-        clipped_gradients = []
-        for g in gradients:
-            if g is not None:
-                clipped_gradients.append(tf.clip_by_global_norm([g], 1.0)[0][0]) # Clip one gradient at a time
-            else:
-                clipped_gradients.append(None)
-        # Or simpler if all gradients are always present:
-        # gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
+        # Robust gradient clipping
+        clipped_grads_and_vars = []
+        for grad, var in zip(gradients, self.student_model.trainable_variables):
+            if grad is not None:
+                clipped_grads_and_vars.append((tf.clip_by_norm(grad, 1.0), var))
+        self.optimizer.apply_gradients(clipped_grads_and_vars)
 
-        # Filter out None gradients before zipping with variables, if using the individual clipping
-        trainable_vars = self.student_model.trainable_variables
-        grads_and_vars = []
-        for g, v in zip(clipped_gradients, trainable_vars):
-            if g is not None:
-                grads_and_vars.append((g, v))       
-        self.optimizer.apply_gradients(zip(gradients, self.student_model.trainable_variables))
-
-        self._update_teacher_model() # This now ONLY does base EMA + BN copy
+        self._update_teacher_model() 
 
         self.compiled_metrics.update_state(true_labels, student_labeled_logits)
-
         logs = {'loss': total_loss, 'supervised_loss': supervised_loss, 'consistency_loss': consistency_loss_value}
         for metric in self.metrics: logs[metric.name] = metric.result()
         return logs
 
+    # --- THIS IS THE HELPER METHOD FOR EXPLICIT WEIGHT COPY ---
+    def _perform_explicit_model_copy(self, source_model, target_model):
+        """Helper function to explicitly copy weights layer by layer, component by component."""
+        # tf.print(f"  ExplicitCopy: Attempting to copy from {source_model.name} to {target_model.name}", output_stream=sys.stderr)
+        if len(source_model.layers) != len(target_model.layers):
+            tf.print(f"  CRITICAL ExplicitCopy: Layer count MISMATCH! Source: {len(source_model.layers)}, Target: {len(target_model.layers)}", output_stream=sys.stderr)
+            return False # Indicate failure
+
+        all_layers_copied_successfully = True
+        # Iterating through the top-level layers of the source and target models
+        for s_top_layer, t_top_layer in zip(source_model.layers, target_model.layers):
+            
+            # Check if the current top-level layer is a UNetBlock instance
+            if isinstance(s_top_layer, UNetBlock) and isinstance(t_top_layer, UNetBlock):
+                try:
+                    # tf.print(f"    Copying UNetBlock components: {s_top_layer.name} -> {t_top_layer.name}", output_stream=sys.stderr)
+                    t_top_layer.conv1.set_weights(s_top_layer.conv1.get_weights())
+                    t_top_layer.bn1.set_weights(s_top_layer.bn1.get_weights())
+                    t_top_layer.conv2.set_weights(s_top_layer.conv2.get_weights())
+                    t_top_layer.bn2.set_weights(s_top_layer.bn2.get_weights())
+                    
+                    # Dropout layers usually don't have weights, but this is safe if they did
+                    if hasattr(s_top_layer, 'dropout') and s_top_layer.dropout is not None and \
+                       hasattr(t_top_layer, 'dropout') and t_top_layer.dropout is not None and \
+                       s_top_layer.dropout.weights: 
+                        # Corrected: use t_top_layer and s_top_layer here
+                        t_top_layer.dropout.set_weights(s_top_layer.dropout.get_weights())
+                except Exception as e_ub_copy:
+                    tf.print(f"    ERROR copying components of UNetBlock {s_top_layer.name}: {type(e_ub_copy).__name__} - {e_ub_copy}", output_stream=sys.stderr)
+                    all_layers_copied_successfully = False
+            
+            # Handle other standard Keras layers that have weights (e.g., Conv2DTranspose, final Conv2D)
+            elif hasattr(s_top_layer, 'weights') and s_top_layer.weights and \
+                 hasattr(t_top_layer, 'set_weights') and callable(t_top_layer.set_weights):
+                try:
+                    # tf.print(f"    Copying generic Layer weights: {s_top_layer.name} -> {t_top_layer.name}", output_stream=sys.stderr)
+                    t_top_layer.set_weights(s_top_layer.get_weights())
+                except Exception as e_gen_copy:
+                    tf.print(f"    ERROR copying weights for generic Layer {s_top_layer.name} (type {type(s_top_layer).__name__}): {type(e_gen_copy).__name__} - {e_gen_copy}", output_stream=sys.stderr)
+                    all_layers_copied_successfully = False
+            # else: # Layer has no weights (e.g., MaxPooling, ReLU as separate layer, Flatten, etc.)
+                # tf.print(f"    Skipping Layer (no weights or not standard Keras layer): {s_top_layer.name}", output_stream=sys.stderr)
+        
+        return all_layers_copied_successfully
+    # --- END HELPER METHOD ---
+
     def test_step(self, data):
         val_images, val_labels = data
+        current_mt_epoch = self.mt_phase_current_epoch 
+
         student_val_logits = self.student_model(val_images, training=False)
         val_student_loss = self.compiled_loss(val_labels, student_val_logits, regularization_losses=self.student_model.losses)
-        self.compiled_metrics.update_state(val_labels, student_val_logits) # For val_student_dice
+        self.compiled_metrics.update_state(val_labels, student_val_logits) 
 
+        teacher_weights_backup = None
+        copied_for_debug_this_step = False
+
+        # Check if we are in the "direct copy" phase FOR VALIDATION DEBUGGING
+        # self.teacher_direct_copy_epochs_config is passed from run_mean_teacher_v2.py args
+        if hasattr(self, 'teacher_direct_copy_epochs_config') and \
+        tf.less(current_mt_epoch, self.teacher_direct_copy_epochs_config): # True for first N MT epochs
+            
+            # This block needs to run eagerly for get_weights/set_weights or the explicit copy.
+            if tf.config.functions_run_eagerly(): # Check if eager mode is active
+                tf.print(f"DEBUG test_step: MT Epoch {current_mt_epoch + 1}. Forcing teacher = student for validation via explicit copy.", output_stream=sys.stderr)
+                try:
+                    # Backup teacher's current weights (which were EMA'd during the epoch's training steps)
+                    # get_weights() returns NumPy arrays, suitable for set_weights()
+                    teacher_weights_backup = self.teacher_model.get_weights() 
+                    
+                    # Perform the robust, explicit copy from student to teacher
+                    copy_success = self._perform_explicit_model_copy(self.student_model, self.teacher_model)
+                    
+                    if copy_success:
+                        copied_for_debug_this_step = True
+                        tf.print("  DEBUG test_step: Explicit copy to teacher for validation successful.", output_stream=sys.stderr)
+                    else:
+                        tf.print("  ERROR test_step: Explicit copy to teacher for validation FAILED. Teacher may not be identical to student.", output_stream=sys.stderr)
+                except Exception as e_val_copy:
+                    tf.print(f"  ERROR test_step: Exception during explicit copy for validation: {type(e_val_copy).__name__} - {e_val_copy}", output_stream=sys.stderr)
+            else: # Should not happen if run_functions_eagerly(True) is set globally
+                tf.print("WARN test_step: Eager execution is OFF. Cannot reliably force teacher=student for debug in test_step. Teacher evaluated with its EMA weights.", output_stream=sys.stderr)
+
+        # Now, teacher_model (if copy was successful and eager mode was on) has student's current weights
         teacher_val_logits = self.teacher_model(val_images, training=False)
-        teacher_dice_score_batch = self._calculate_dice(val_labels, teacher_val_logits)
+        #teacher_dice_score_batch = self._calculate_dice(val_labels, teacher_val_logits)
+        teacher_dice_score_for_this_batch = self._calculate_dice(val_labels, teacher_val_logits)         # Restore original teacher weights if they were backed up and copied for debug
+        if copied_for_debug_this_step and teacher_weights_backup is not None:
+            if tf.config.functions_run_eagerly(): # Check again, though it should be true if above block ran
+                try:
+                    self.teacher_model.set_weights(teacher_weights_backup)
+                    # tf.print("  DEBUG test_step: Restored teacher's original EMA'd weights after validation.", output_stream=sys.stderr)
+                except Exception as e_restore:
+                    tf.print(f"  ERROR test_step: Exception restoring teacher weights: {type(e_restore).__name__} - {e_restore}", output_stream=sys.stderr)
         
-        # --- UNCOMMENT THE DEBUG BLOCK BELOW IF YOU STILL GET TEACHER DICE = 1.0 ---
-        # if tf.config.functions_run_eagerly() or tf.compat.v1.executing_eagerly_outside_functions():
-        #     y_true_b = tf.cast(val_labels, tf.float32)
-        #     teacher_pred_probs_b = tf.nn.sigmoid(teacher_val_logits)
-        #     teacher_pred_binary_b = tf.cast(teacher_pred_probs_b > 0.5, tf.float32)
-        #     gt_sums_per_sample = tf.reduce_sum(y_true_b, axis=[1,2,3])
-        #     teacher_pred_sums_per_sample = tf.reduce_sum(teacher_pred_binary_b, axis=[1,2,3])
-        #     num_gt_empty = tf.reduce_sum(tf.cast(tf.equal(gt_sums_per_sample, 0.0), tf.int32))
-        #     num_teacher_pred_empty = tf.reduce_sum(tf.cast(tf.equal(teacher_pred_sums_per_sample, 0.0), tf.int32))
-        #     both_empty_mask = tf.logical_and(tf.equal(gt_sums_per_sample, 0.0), tf.equal(teacher_pred_sums_per_sample, 0.0))
-        #     num_both_empty = tf.reduce_sum(tf.cast(both_empty_mask, tf.int32))
-        #     avg_teacher_prob_batch = tf.reduce_mean(teacher_pred_probs_b)
-        #     tf.print(
-        #         "DEBUG ValBatch Teacher - BatchDice:", teacher_dice_score_batch,
-        #         "| GT empty samples:", num_gt_empty, "/", tf.shape(val_labels)[0],
-        #         "| TeacherPred empty samples:", num_teacher_pred_empty, "/", tf.shape(val_labels)[0],
-        #         "| BothEmpty samples:", num_both_empty, "/", tf.shape(val_labels)[0],
-        #         "| AvgTeacherProb:", avg_teacher_prob_batch,
-        #         output_stream=sys.stderr, summarize=-1
-        #     )
+        # Your detailed per-batch debug prints for teacher dice components can go here
+        # (the one printing GT empty, TeacherPred empty, AvgTeacherProb)
+        # ...
         
-        final_logs = {'loss': val_student_loss, 'teacher_dice': teacher_dice_score_batch}
-        for metric in self.metrics: 
-            final_logs[metric.name] = metric.result()
+        final_logs = {'loss': val_student_loss, 'teacher_dice': teacher_dice_score_for_this_batch}
+        for metric in self.metrics: # This adds 'student_dice' (compiled metric)
+            final_logs[metric.name] = metric.result() # Keras will make this 'val_student_dice' during logging
             
         return final_logs
-
+    # @property
+    # def metrics(self):
+    #     # Override to include our custom teacher validation metric
+    #     # This ensures Keras handles its state (e.g., reset_state at epoch start)
+    #     base_metrics = super().metrics
+    #     return base_metrics + [self.teacher_val_dice_metric]
 
 class StableConsistencyLoss(tf.keras.losses.Loss):
     """Stable Consistency Loss with temperature scaling"""
@@ -962,13 +1039,16 @@ class MixMatchTrainer:
         tf.print(f"MixMatch Optimizer: Adam with CosineDecayRestarts LR schedule (initial: {initial_lr_val}).")
         
         # Loss Functions
-        self.supervised_loss_fn = CombinedLoss(config) # Assumes CombinedLoss uses Dice+Focal
-        self.unsupervised_loss_fn = tf.keras.losses.MeanSquaredError()
+        #self.supervised_loss_fn = CombinedLoss(config) # Assumes CombinedLoss uses Dice+Focal
 
+        self.supervised_loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+        self.unsupervised_loss_fn = tf.keras.losses.MeanSquaredError()
+        tf.print(f"  Unsupervised loss (L_u) set to: {type(self.unsupervised_loss_fn).__name__}")
         self.history = {
             'epoch': [], 'total_loss': [], 'L_x': [], 'L_u': [], 'lambda_u': [],
             'val_dice': [], 'learning_rate': []
         }
+        tf.print("MixMatch trainer initialization complete! Using BinaryCrossentropy for L_x.")         
         tf.print("MixMatch trainer initialization complete!")
 
     def _sharpen_probs(self, p, T):

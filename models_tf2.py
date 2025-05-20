@@ -204,6 +204,16 @@ class PancreasSeg(Model):
     #     # return projections
     #     pass
 
+class DiceCoefficient(tf.keras.metrics.Metric):
+    def __init__(self, name='dice_coefficient',**kwargs):
+        super().__init__(name=name,**kwargs); self.sum_ds=self.add_weight(name='sum_ds',initializer='zeros'); self.n_samp=self.add_weight(name='n_samp',initializer='zeros'); self.s=1e-6
+    def update_state(self, yt, yp_logits, sample_weight=None):
+        yt_f=tf.cast(yt,tf.float32); ypp=tf.nn.sigmoid(yp_logits); ypb=tf.cast(ypp>0.5,tf.float32)
+        intr=tf.reduce_sum(yt_f*ypb,axis=[1,2,3]); sum_t=tf.reduce_sum(yt_f,axis=[1,2,3]); sum_p=tf.reduce_sum(ypb,axis=[1,2,3])
+        dice_samp=(2.*intr+self.s)/(sum_t+sum_p+self.s); self.sum_ds.assign_add(tf.reduce_sum(dice_samp)); self.n_samp.assign_add(tf.cast(tf.shape(yt)[0],tf.float32))
+    def result(self): return tf.cond(tf.equal(self.n_samp,0.0),lambda:0.0,lambda:self.sum_ds/self.n_samp)
+    def reset_state(self): self.sum_ds.assign(0.0); self.n_samp.assign(0.0)
+    def get_config(self): conf=super().get_config(); conf.update({'smooth':self.s}); return conf
 
 class CombinedLoss(tf.keras.losses.Loss):
     def __init__(self, config=None, smooth=1e-6, alpha=0.25, gamma=2):

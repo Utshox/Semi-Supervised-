@@ -14,10 +14,79 @@ from config import ExperimentConfig, StableSSLConfig # Make sure StableSSLConfig
 from data_loader_tf2 import DataPipeline
 # PancreasSeg is used by MixMatchTrainer
 from train_ssl_tf2n import MixMatchTrainer # Import your MixMatchTrainer
-from run_mean_teacher_v2 import prepare_data_paths 
 
 
 AUTOTUNE = tf.data.experimental.AUTOTUNE
+
+
+# --- PREPARE_DATA_PATHS FUNCTION (Copied here) ---
+def prepare_data_paths(data_dir_str: str, num_labeled_patients: int, num_validation_patients: int, seed: int = 42):
+    data_dir = Path(data_dir_str)
+    all_patient_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir() and p.name.startswith("pancreas_")])
+    
+    if not all_patient_dirs:
+        # Use tf.print if inside a tf.function context, otherwise Python print
+        # Since this is top-level in the script, Python print is fine here.
+        print(f"ERROR: No patient directories found in {data_dir_str} matching 'pancreas_*'.", file=sys.stderr)
+        raise FileNotFoundError(f"No patient directories found in {data_dir_str} matching 'pancreas_*'.")
+
+    random.seed(seed)
+    random.shuffle(all_patient_dirs)
+
+    if len(all_patient_dirs) < num_labeled_patients + num_validation_patients:
+        msg = (f"Not enough patient data ({len(all_patient_dirs)}) for the specified splits: "
+               f"{num_labeled_patients} labeled, {num_validation_patients} validation.")
+        print(f"ERROR: {msg}", file=sys.stderr)
+        raise ValueError(msg)
+
+    validation_patient_dirs = all_patient_dirs[:num_validation_patients]
+    remaining_patient_dirs = all_patient_dirs[num_validation_patients:]
+    
+    labeled_patient_dirs = remaining_patient_dirs[:num_labeled_patients]
+    unlabeled_patient_dirs = remaining_patient_dirs[num_labeled_patients:] 
+
+    print(f"Data Split: Total patient dirs found: {len(all_patient_dirs)}")
+    print(f"  Labeled set size (patients): {len(labeled_patient_dirs)}")
+    print(f"  Unlabeled set size (patients): {len(unlabeled_patient_dirs)}")
+    print(f"  Validation set size (patients): {len(validation_patient_dirs)}")
+
+    def get_file_paths_from_patient_dirs(patient_dirs_list, is_labeled=True):
+        image_paths = []
+        label_paths = [] if is_labeled else None
+        
+        for p_dir in patient_dirs_list:
+            img_file = p_dir / "image.npy"
+            mask_file = p_dir / "mask.npy"
+            
+            if img_file.exists() and (not is_labeled or mask_file.exists()):
+                image_paths.append(str(img_file))
+                if is_labeled:
+                    label_paths.append(str(mask_file))
+            else:
+                if not img_file.exists():
+                    print(f"Warning: Missing image.npy in {p_dir}", file=sys.stderr)
+                if is_labeled and not mask_file.exists():
+                     print(f"Warning: Missing mask.npy in {p_dir} (for labeled data)", file=sys.stderr)
+        
+        if is_labeled:
+            return image_paths, label_paths
+        return image_paths
+
+    labeled_images, labeled_labels = get_file_paths_from_patient_dirs(labeled_patient_dirs, is_labeled=True)
+    unlabeled_images = get_file_paths_from_patient_dirs(unlabeled_patient_dirs, is_labeled=False)
+    validation_images, validation_labels = get_file_paths_from_patient_dirs(validation_patient_dirs, is_labeled=True)
+    
+    if not labeled_images: print("CRITICAL WARNING: No Labeled image paths were found after filtering for existing files.", file=sys.stderr)
+    # It's okay if unlabeled_images is empty if all data is used for labeled/validation.
+    if not unlabeled_images and len(unlabeled_patient_dirs) > 0: print("WARNING: Unlabeled patient dirs were selected, but no valid image.npy files found in them.", file=sys.stderr)
+    if not validation_images: print("CRITICAL WARNING: No Validation image paths were found after filtering for existing files.", file=sys.stderr)
+
+    return {
+        'labeled': {'images': labeled_images, 'labels': labeled_labels},
+        'unlabeled': {'images': unlabeled_images},
+        'validation': {'images': validation_images, 'labels': validation_labels}
+    }
+# --- END PREPARE_DATA_PATHS FUNCTION ---
 
 def main(args):
     # --- GPU SETUP (Same as run_mean_teacher_v2.py) ---
