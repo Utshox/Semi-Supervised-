@@ -1134,6 +1134,8 @@ class MixMatchTrainer:
         intersection = tf.reduce_sum(y_true_f * y_pred_f_binary, axis=[1,2,3])
         union_sum = tf.reduce_sum(y_true_f, axis=[1,2,3]) + tf.reduce_sum(y_pred_f_binary, axis=[1,2,3])
         dice_per_sample = (2. * intersection + 1e-6) / (union_sum + 1e-6)
+        # Add NaN handling
+        dice_per_sample = tf.where(tf.math.is_nan(dice_per_sample), tf.zeros_like(dice_per_sample), dice_per_sample)
         return tf.reduce_mean(dice_per_sample)
 
     def validate(self, val_dataset):
