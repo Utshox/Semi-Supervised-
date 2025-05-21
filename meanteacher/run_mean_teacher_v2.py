@@ -26,12 +26,12 @@ else:
 # Assuming these modules are in the same directory or Python path
 from config import ExperimentConfig, StableSSLConfig
 from data_loader_tf2 import DataPipeline
-from models_tf2 import PancreasSeg # UNetBlock is used by PancreasSeg
+from models_tf2 import PancreasSeg , UNetBlock, DiceCoefficient #is used by PancreasSeg
 from train_ssl_tf2n import MeanTeacherTrainer # Ensure this has phased EMA and sharpening_temperature param
 
 # FOR DEBUGGING DATA PIPELINE / CALLBACKS / TF.FUNCTION ISSUES:
-# tf.config.run_functions_eagerly(True)
-# tf.print("INFO: TensorFlow is running functions EAGERLY for debugging.")
+tf.config.run_functions_eagerly(True)
+tf.print("INFO: TensorFlow is running functions EAGERLY for debugging.")
 
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 # --- Define Custom Loss and Metric ---
@@ -49,16 +49,6 @@ class DiceBCELoss(tf.keras.losses.Loss):
     def get_config(self): conf=super().get_config(); conf.update({'weight_bce':self.w_bce,'weight_dice':self.w_dice,'smooth':self.s}); return conf
 
 
-class DiceCoefficient(tf.keras.metrics.Metric):
-    def __init__(self, name='dice_coefficient',**kwargs):
-        super().__init__(name=name,**kwargs); self.sum_ds=self.add_weight(name='sum_ds',initializer='zeros'); self.n_samp=self.add_weight(name='n_samp',initializer='zeros'); self.s=1e-6
-    def update_state(self, yt, yp_logits, sample_weight=None):
-        yt_f=tf.cast(yt,tf.float32); ypp=tf.nn.sigmoid(yp_logits); ypb=tf.cast(ypp>0.5,tf.float32)
-        intr=tf.reduce_sum(yt_f*ypb,axis=[1,2,3]); sum_t=tf.reduce_sum(yt_f,axis=[1,2,3]); sum_p=tf.reduce_sum(ypb,axis=[1,2,3])
-        dice_samp=(2.*intr+self.s)/(sum_t+sum_p+self.s); self.sum_ds.assign_add(tf.reduce_sum(dice_samp)); self.n_samp.assign_add(tf.cast(tf.shape(yt)[0],tf.float32))
-    def result(self): return tf.cond(tf.equal(self.n_samp,0.0),lambda:0.0,lambda:self.sum_ds/self.n_samp)
-    def reset_state(self): self.sum_ds.assign(0.0); self.n_samp.assign(0.0)
-    def get_config(self): conf=super().get_config(); conf.update({'smooth':self.s}); return conf
 
 # --- Callbacks ---
 class MTPhaseEpochUpdater(tf.keras.callbacks.Callback):
@@ -66,15 +56,27 @@ class MTPhaseEpochUpdater(tf.keras.callbacks.Callback):
         if hasattr(self.model, 'mt_phase_current_epoch'): self.model.mt_phase_current_epoch.assign(epoch)
 
 class TeacherDirectCopyCallback(tf.keras.callbacks.Callback):
-    def __init__(self, student_model_ref, direct_copy_epochs=0):
-        super().__init__(); self.student_model_ref=student_model_ref; self.direct_copy_epochs=direct_copy_epochs
-        print(f"TeacherDirectCopyCallback: Will copy for first {direct_copy_epochs} MT epochs.")
+    def __init__(self, student_model_to_copy_from, direct_copy_epochs=0):
+        super().__init__()
+        self.student_to_copy = student_model_to_copy_from
+        self.direct_copy_epochs = direct_copy_epochs
+        print(f"TeacherDirectCopyCallback: Initialized. Will use explicit copy for first {self.direct_copy_epochs} MT epochs.")
+
     def on_epoch_begin(self, epoch, logs=None):
         if epoch < self.direct_copy_epochs:
-            tf.print(f"MT Epoch {epoch+1}: TeacherDirectCopyCallback - COPYING student to teacher.", output_stream=sys.stderr)
-            try: self.model.teacher_model.set_weights(self.student_model_ref.get_weights())
-            except Exception as e: tf.print(f"  ERROR in TeacherDirectCopyCallback: {e}", output_stream=sys.stderr)
-                # --- END INTENSE DEBUGGING ---        
+            tf.print(f"MT Epoch {epoch + 1}/{self.direct_copy_epochs}: TeacherDirectCopyCallback - Performing EXPLICIT component-wise weight copy.", output_stream=sys.stderr)
+            
+            # self.model is the MeanTeacherTrainer instance
+            # self.student_to_copy is the actual student Keras model (e.g., student_model_mt)
+            if hasattr(self.model, '_perform_explicit_model_copy') and callable(self.model._perform_explicit_model_copy):
+                copy_success = self.model._perform_explicit_model_copy(self.student_to_copy, self.model.teacher_model)
+                if copy_success:
+                    tf.print(f"  SUCCESS: TeacherDirectCopyCallback - Explicit copy for MT Epoch {epoch + 1} successful.", output_stream=sys.stderr)
+                else:
+                    tf.print(f"  ERROR: TeacherDirectCopyCallback - Explicit copy for MT Epoch {epoch + 1} FAILED.", output_stream=sys.stderr)
+            else:
+                tf.print("  ERROR: TeacherDirectCopyCallback - MeanTeacherTrainer instance does not have _perform_explicit_model_copy method.", output_stream=sys.stderr)
+
 
 class ConsistencyWeightScheduler(tf.keras.callbacks.Callback):
     def __init__(self, consistency_weight_var, max_weight, 
@@ -246,13 +248,18 @@ def main(args):
         student_model=student_model_mt, 
         teacher_model=teacher_model_mt, 
         ema_decay=args.ema_decay, # This is the base_ema_decay used by trainer's _update_teacher_model
-        sharpening_temperature=args.sharpening_temperature
+        sharpening_temperature=args.sharpening_temperature,
+        teacher_direct_copy_epochs_config=args.teacher_direct_copy_epochs # Pass this
         # teacher_direct_copy_epochs is NOT a parameter of MeanTeacherTrainer.__init__
     )
     mean_teacher_trainer.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate),
                                  loss=DiceBCELoss(), metrics=[DiceCoefficient(name='student_dice')])
     print("MeanTeacherTrainer compiled for MT phase.")
-
+    # Create a new optimizer with the lower MT learning rate
+    optimizer_mt = tf.keras.optimizers.Adam(learning_rate=args.mt_learning_rate)
+    mean_teacher_trainer.compile(optimizer=optimizer_mt,
+                                loss=DiceBCELoss(), metrics=[DiceCoefficient(name='student_dice')])
+    print("MeanTeacherTrainer compiled with MT learning rate.")
     lab_ds_mt = data_pipeline.build_labeled_dataset(data_paths['labeled']['images'], data_paths['labeled']['labels'], args.batch_size, True).prefetch(AUTOTUNE)
     if data_paths['unlabeled']['images']:
         unlab_ds_mt = data_pipeline.build_unlabeled_dataset_for_mean_teacher(data_paths['unlabeled']['images'], args.batch_size, True).repeat().prefetch(AUTOTUNE)
@@ -323,7 +330,8 @@ if __name__ == "__main__":
     
     parser.add_argument("--num_epochs", type=int, default=150, help="Epochs for MT training phase.")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
-    
+    parser.add_argument('--mt_learning_rate', type=float, default=2e-5,
+                   help='Learning rate for Mean Teacher phase (lower than pretraining)')
     parser.add_argument("--teacher_direct_copy_epochs", type=int, default=10, 
                         help="Initial MT epochs: Teacher IS student (direct copy by callback).")
     parser.add_argument("--ema_decay", type=float, default=0.999, 

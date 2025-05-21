@@ -761,7 +761,7 @@ class MeanTeacherTrainer(tf.keras.Model):
         self.consistency_weight = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="consistency_weight")
         self.consistency_loss_fn = tf.keras.losses.MeanSquaredError()
         self.mt_phase_current_epoch = tf.Variable(-1, dtype=tf.int32, trainable=False, name="mt_phase_epoch_counter")
-        self.teacher_val_dice_metric = DiceCoefficient(name="teacher_val_dice_obj")
+        #self.teacher_val_dice_metric = DiceCoefficient(name="teacher_val_dice_obj")
  
  
     # --- ADD THIS CALL METHOD ---
@@ -802,10 +802,6 @@ class MeanTeacherTrainer(tf.keras.Model):
 
     def compile(self, optimizer, loss, metrics=None, **kwargs):
         super().compile(optimizer=optimizer, loss=loss, metrics=metrics, **kwargs)
-
-    @property
-    def metrics(self):
-        return super().metrics
 
     def train_step(self, data):
         labeled_data, unlabeled_data = data
@@ -888,65 +884,70 @@ class MeanTeacherTrainer(tf.keras.Model):
         
         return all_layers_copied_successfully
     # --- END HELPER METHOD ---
-
+    @property
+    def metrics(self):
+        return super().metrics
+    
     def test_step(self, data):
         val_images, val_labels = data
-        current_mt_epoch = self.mt_phase_current_epoch 
+        # current_mt_epoch = self.mt_phase_current_epoch # Not strictly needed in this clean test_step
 
+        # 1. Student Model Evaluation
         student_val_logits = self.student_model(val_images, training=False)
-        val_student_loss = self.compiled_loss(val_labels, student_val_logits, regularization_losses=self.student_model.losses)
-        self.compiled_metrics.update_state(val_labels, student_val_logits) 
+        # Calculate student's supervised loss on validation data
+        # Keras automatically tracks this as 'val_loss' if 'loss' is the key from train_step.
+        # The 'loss' key in the returned dict will be taken as the main validation loss.
+        val_main_loss = self.compiled_loss(
+            val_labels, 
+            student_val_logits, 
+            regularization_losses=self.student_model.losses
+        )
+        
+        # Update student's compiled metrics (e.g., student_dice)
+        # This will make self.metrics[i].result() have the validation value.
+        self.compiled_metrics.update_state(val_labels, student_val_logits)
 
-        teacher_weights_backup = None
-        copied_for_debug_this_step = False
-
-        # Check if we are in the "direct copy" phase FOR VALIDATION DEBUGGING
-        # self.teacher_direct_copy_epochs_config is passed from run_mean_teacher_v2.py args
-        if hasattr(self, 'teacher_direct_copy_epochs_config') and \
-        tf.less(current_mt_epoch, self.teacher_direct_copy_epochs_config): # True for first N MT epochs
-            
-            # This block needs to run eagerly for get_weights/set_weights or the explicit copy.
-            if tf.config.functions_run_eagerly(): # Check if eager mode is active
-                tf.print(f"DEBUG test_step: MT Epoch {current_mt_epoch + 1}. Forcing teacher = student for validation via explicit copy.", output_stream=sys.stderr)
-                try:
-                    # Backup teacher's current weights (which were EMA'd during the epoch's training steps)
-                    # get_weights() returns NumPy arrays, suitable for set_weights()
-                    teacher_weights_backup = self.teacher_model.get_weights() 
-                    
-                    # Perform the robust, explicit copy from student to teacher
-                    copy_success = self._perform_explicit_model_copy(self.student_model, self.teacher_model)
-                    
-                    if copy_success:
-                        copied_for_debug_this_step = True
-                        tf.print("  DEBUG test_step: Explicit copy to teacher for validation successful.", output_stream=sys.stderr)
-                    else:
-                        tf.print("  ERROR test_step: Explicit copy to teacher for validation FAILED. Teacher may not be identical to student.", output_stream=sys.stderr)
-                except Exception as e_val_copy:
-                    tf.print(f"  ERROR test_step: Exception during explicit copy for validation: {type(e_val_copy).__name__} - {e_val_copy}", output_stream=sys.stderr)
-            else: # Should not happen if run_functions_eagerly(True) is set globally
-                tf.print("WARN test_step: Eager execution is OFF. Cannot reliably force teacher=student for debug in test_step. Teacher evaluated with its EMA weights.", output_stream=sys.stderr)
-
-        # Now, teacher_model (if copy was successful and eager mode was on) has student's current weights
+        # 2. Teacher Model Evaluation
+        # Teacher model uses its current EMA'd weights.
         teacher_val_logits = self.teacher_model(val_images, training=False)
-        #teacher_dice_score_batch = self._calculate_dice(val_labels, teacher_val_logits)
-        teacher_dice_score_for_this_batch = self._calculate_dice(val_labels, teacher_val_logits)         # Restore original teacher weights if they were backed up and copied for debug
-        if copied_for_debug_this_step and teacher_weights_backup is not None:
-            if tf.config.functions_run_eagerly(): # Check again, though it should be true if above block ran
-                try:
-                    self.teacher_model.set_weights(teacher_weights_backup)
-                    # tf.print("  DEBUG test_step: Restored teacher's original EMA'd weights after validation.", output_stream=sys.stderr)
-                except Exception as e_restore:
-                    tf.print(f"  ERROR test_step: Exception restoring teacher weights: {type(e_restore).__name__} - {e_restore}", output_stream=sys.stderr)
+        # Calculate teacher's Dice score for THIS BATCH using the helper method
+        teacher_dice_score_for_this_batch = self._calculate_dice(val_labels, teacher_val_logits) 
         
-        # Your detailed per-batch debug prints for teacher dice components can go here
-        # (the one printing GT empty, TeacherPred empty, AvgTeacherProb)
-        # ...
+        # 3. Prepare Logs
+        # Keras will average 'teacher_dice' (from per-batch returns) over all validation batches 
+        # to get the epoch-level 'val_teacher_dice'.
+        # The 'loss' key here will be logged by Keras as 'val_loss'.
+        logs = {
+            'loss': val_main_loss, 
+            'teacher_dice': teacher_dice_score_for_this_batch
+        }
         
-        final_logs = {'loss': val_student_loss, 'teacher_dice': teacher_dice_score_for_this_batch}
-        for metric in self.metrics: # This adds 'student_dice' (compiled metric)
-            final_logs[metric.name] = metric.result() # Keras will make this 'val_student_dice' during logging
+        # Add results from student's compiled metrics
+        # For a metric named 'student_dice', Keras will log its result as 'val_student_dice'.
+        for metric_obj in self.metrics: 
+            if metric_obj.name != 'loss': # Avoid re-adding 'loss' if it's in self.metrics by default
+                 logs[metric_obj.name] = metric_obj.result() 
             
-        return final_logs
+        return logs
+    
+    def _perform_explicit_model_copy(self, source_model, target_model):
+        # ... (The robust layer-wise copy logic from previous responses) ...
+        if len(source_model.layers) != len(target_model.layers): return False
+        all_ok = True
+        for s_top_layer, t_top_layer in zip(source_model.layers, target_model.layers):
+            if isinstance(s_top_layer, UNetBlock) and isinstance(t_top_layer, UNetBlock):
+                try:
+                    t_top_layer.conv1.set_weights(s_top_layer.conv1.get_weights())
+                    t_top_layer.bn1.set_weights(s_top_layer.bn1.get_weights())
+                    t_top_layer.conv2.set_weights(s_top_layer.conv2.get_weights())
+                    t_top_layer.bn2.set_weights(s_top_layer.bn2.get_weights())
+                    if hasattr(s_top_layer,'dropout') and s_top_layer.dropout and hasattr(t_top_layer,'dropout') and t_top_layer.dropout and s_top_layer.dropout.weights:
+                        t_top_layer.dropout.set_weights(s_top_layer.dropout.get_weights())
+                except Exception as e: all_ok=False; tf.print(f"Err copy UNetBlock {s_top_layer.name}:{e}",sys.stderr)
+            elif hasattr(s_top_layer,'weights') and s_top_layer.weights and hasattr(t_top_layer,'set_weights'):
+                try: t_top_layer.set_weights(s_top_layer.get_weights())
+                except Exception as e: all_ok=False; tf.print(f"Err copy Layer {s_top_layer.name}:{e}",sys.stderr)
+        return all_ok    
     # @property
     # def metrics(self):
     #     # Override to include our custom teacher validation metric
